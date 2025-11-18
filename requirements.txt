@@ -1,0 +1,8 @@
+aiogram==3.4.1
+google-generativeai==0.5.2
+stripe==9.4.0
+aiohttp==3.8.4
+python-dotenv==1.0.0
+certifi==2024.9.1
+requests==2.31.0
+typing-extensions==4.8.0
