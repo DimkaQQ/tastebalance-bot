@@ -18,13 +18,18 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 import google.generativeai as genai
+load_dotenv()
 
+# ==========
+# intentionally empty: we don't want bot commands visible, но main() вызывает эту функцию — чтобы не падало
+async def set_commands(bot):
+    return
+# ==========
 
 # ======================================
 # 🔧 Настройки
 # ======================================
 
-load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GOOGLE_GEMINI_API_KEY")
 
@@ -34,6 +39,21 @@ dp.workflow_data = {}
 
 genai.configure(api_key=GEMINI_API_KEY)
 logging.basicConfig(level=logging.INFO)
+
+# ========== Stripe & aiohttp для webhook ==========
+import stripe
+from aiohttp import web
+
+# Stripe config — подгружаются из .env
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")  # webhook signing secret
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")  # optional: if present, create subscription
+DOMAIN = os.getenv("DOMAIN", "")  # required for success/cancel URLs in Stripe
+CURRENCY = os.getenv("CURRENCY", "usd")
+
+# инициализация stripe (если ключ задан)
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 # ======================================
 # 🗄️ База данных
@@ -423,14 +443,17 @@ async def check_premium(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "buy_premium")
 async def buy_premium(callback: types.CallbackQuery):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Активировать вручную", callback_data="activate_premium")
-    builder.adjust(1)
-    await callback.message.answer(
-        "💳 Оплата через Telegram Stars в разработке.\n"
-        "Пока можно активировать вручную 👇",
-        reply_markup=builder.as_markup()
-    )
+    user_id = callback.from_user.id
+    await callback.message.answer("🔗 Создаю платёжную сессию…")
+    try:
+        # stripe python sdk — синхронный, вызываем в thread
+        url = await asyncio.to_thread(create_checkout_session_sync, user_id)
+        await callback.message.answer(
+            f"Откройте ссылку для оплаты (checkout):\n\n{url}\n\nПосле успешной оплаты вы получите Premium автоматически."
+        )
+    except Exception as e:
+        logging.exception(f"Failed to create stripe session: {e}")
+        await callback.message.answer("⚠️ Не удалось создать платёжную сессию. Проверьте настройки Stripe.")
     await callback.answer()
 
 
@@ -467,6 +490,118 @@ async def safe_download(bot, file_path, retries=3, timeout=30):
             else:
                 raise
 
+# =================== Stripe helpers ===================
+
+def _make_success_cancel_urls():
+    """Вспомогательная функция, возвращает success и cancel URL для Checkout."""
+    success_url = f"https://{DOMAIN}/success?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"https://{DOMAIN}/cancel"
+    return success_url, cancel_url
+
+def create_checkout_session_sync(user_id: int):
+    """
+    Создаёт Stripe Checkout Session (синхронно).
+    Возвращает session.url
+    """
+    if not STRIPE_SECRET_KEY:
+        raise RuntimeError("Stripe not configured (STRIPE_SECRET_KEY missing)")
+
+    success_url, cancel_url = _make_success_cancel_urls()
+    metadata = {"user_id": str(user_id)}
+
+    if STRIPE_PRICE_ID:
+        # Подписка
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata=metadata,
+        )
+    else:
+        # Разовый платёж $7.99
+        unit_amount = 799  # cents
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            mode="payment",
+            line_items=[
+                {
+                    "price_data": {
+                        "currency": CURRENCY,
+                        "product_data": {"name": "TasteBalance Premium"},
+                        "unit_amount": unit_amount,
+                    },
+                    "quantity": 1,
+                }
+            ],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata=metadata,
+        )
+
+    return session.url
+
+
+# Webhook handler — aiohttp
+async def stripe_webhook(request: web.Request):
+    payload = await request.read()
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    # Подписка должна быть настроена в Stripe: endpoint -> /stripe/webhook
+    if STRIPE_WEBHOOK_SECRET:
+        try:
+            event = stripe.Webhook.construct_event(
+                payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET
+            )
+        except ValueError as e:
+            logging.warning(f"Stripe webhook invalid payload: {e}")
+            return web.Response(status=400)
+        except stripe.error.SignatureVerificationError as e:
+            logging.warning(f"Stripe webhook signature error: {e}")
+            return web.Response(status=400)
+    else:
+        # Если нет секретного ключа — просто парсим JSON (не безопасно, только для локального теста)
+        try:
+            event = json.loads(payload)
+        except Exception as e:
+            logging.warning(f"Stripe webhook parse error (no secret): {e}")
+            return web.Response(status=400)
+
+    try:
+        etype = event["type"] if isinstance(event, dict) else event.get("type")
+        if etype == "checkout.session.completed":
+            session = event["data"]["object"]
+            user_id = session.get("metadata", {}).get("user_id")
+            if user_id:
+                # Ставим Premium на 30 дней — простая логика
+                until_date = (datetime.now() + timedelta(days=30)).isoformat()
+                try:
+                    update_user(int(user_id), is_premium=1, premium_until=until_date)
+                    logging.info(f"Activated premium for user {user_id} until {until_date}")
+                except Exception as e:
+                    logging.exception(f"Failed to activate premium for {user_id}: {e}")
+
+        # Опционально: подписки — продление по invoice.payment_succeeded
+        if etype == "invoice.payment_succeeded":
+            invoice = event["data"]["object"]
+            # можно продлевать premium по subscription (если хотите точнее — используйте subscription status)
+    except Exception as e:
+        logging.exception(f"Error handling stripe event: {e}")
+        return web.Response(status=500)
+
+    return web.Response(status=200)
+
+
+async def start_stripe_webserver(host="0.0.0.0", port=8080):
+    """Запускает aiohttp webserver с endpoint /stripe/webhook"""
+    app = web.Application()
+    app.router.add_post("/stripe/webhook", stripe_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    logging.info(f"Stripe webhook server running on {host}:{port}")
 
 # ======================================
 # 💬 Универсальный обработчик текста (ввод блюда, редактирование, отзывы)
@@ -1046,10 +1181,17 @@ async def send_summaries():
 # ======================================
 
 async def main():
+    await set_commands(bot)
+
+    # Запускаем Stripe webhook server, если настроен или для теста
+    try:
+        asyncio.create_task(start_stripe_webserver(host="0.0.0.0", port=8080))
+    except Exception as e:
+        logging.exception("Failed to start stripe webserver: %s", e)
+
     asyncio.create_task(send_summaries())
     logging.info("🚀 TasteBalance запущен и готов к приёму сообщений.")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
