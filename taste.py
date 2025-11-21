@@ -682,14 +682,85 @@ async def stripe_webhook(request: web.Request):
 
 
 async def start_stripe_webserver(host="0.0.0.0", port=8080):
-    """Запускает aiohttp webserver с endpoint /stripe/webhook"""
+    """Запускает aiohttp webserver с endpoint /stripe/webhook + страницы успеха/отмены."""
     app = web.Application()
+
+    # Stripe webhook
     app.router.add_post("/stripe/webhook", stripe_webhook)
+
+    # Страницы после оплаты
+    app.router.add_get("/success", success_page)
+    app.router.add_get("/cancel", cancel_page)
+    app.router.add_get("/", root_page)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
-    logging.info(f"Stripe webhook server running on {host}:{port}")
+    logging.info(f"Stripe webserver running on {host}:{port}")
+
+
+    # --- Страницы после оплаты ---
+
+async def success_page(request: web.Request):
+    """
+    Страница успешной оплаты.
+    Stripe редиректит сюда после checkout.
+    """
+    session_id = request.query.get("session_id", "")
+    # Можно дополнительно дернуть Stripe по session_id, но не обязательно.
+    html = f"""
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>TasteBalance – Оплата успешна</title>
+      </head>
+      <body style="font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; text-align:center; padding:40px;">
+        <h1>✅ Оплата прошла успешно</h1>
+        <p>Можешь вернуться в Telegram – Premium уже активируется (если ещё не активен, подожди пару секунд).</p>
+        <p style="color:#666; font-size:14px;">Session ID: {session_id}</p>
+      </body>
+    </html>
+    """
+    return web.Response(text=html, content_type="text/html")
+
+
+async def cancel_page(request: web.Request):
+    """
+    Страница отмены оплаты.
+    """
+    html = """
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>TasteBalance – Оплата отменена</title>
+      </head>
+      <body style="font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; text-align:center; padding:40px;">
+        <h1>❌ Оплата отменена</h1>
+        <p>Если передумаешь — вернись в Telegram и снова нажми «Получить Premium».</p>
+      </body>
+    </html>
+    """
+    return web.Response(text=html, content_type="text/html")
+
+
+async def root_page(request: web.Request):
+    """
+    Корень домена — просто заглушка.
+    """
+    html = """
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>TasteBalance</title>
+      </head>
+      <body style="font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; text-align:center; padding:40px;">
+        <h1>TasteBalance</h1>
+        <p>Этот домен используется для оплаты и webhook Stripe. Основная работа идёт в Telegram-боте.</p>
+      </body>
+    </html>
+    """
+    return web.Response(text=html, content_type="text/html")
 
 # ======================================
 # 💬 Универсальный обработчик текста (ввод блюда, редактирование, отзывы)
