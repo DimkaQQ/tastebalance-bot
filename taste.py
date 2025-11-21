@@ -315,11 +315,12 @@ async def history_cmd(message: types.Message):
     text = "🕒 *История за 7 дней:*\n\n"
     for d, t, desc, kcal, p, f, c in rows:
         date_part = f"📅 {d}"
-        time_part = f"🕐 {t}" if t else ""
+        #time_part = f"🕐 {t}" if t else ""
         ingredients = desc.replace("Фото еды", "📷 Фото блюда")
 
         text += (
-            f"{date_part}  {time_part}\n"
+            #{time_part} to show time
+            f"{date_part}\n"
             f"🍽️ {ingredients}\n"
             f"🔥 {round(kcal)} ккал — "
             f"Б: {round(p)} Ж: {round(f)} У: {round(c)}\n\n"
