@@ -443,27 +443,45 @@ async def check_premium(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "buy_premium")
 async def buy_premium(callback: types.CallbackQuery):
+    """
+    Создаём Stripe Checkout и отправляем пользователю одно сообщение
+    с кнопкой "💳 Оплатить (Stripe)" — сразу открывает checkout.
+    Убираем промежуточное сообщение «Создаю платёжную сессию…».
+    """
+    await callback.answer()  # быстро закрываем «spinner» у Telegram (без текста)
     user_id = callback.from_user.id
-    await callback.message.answer("🔗 Создаю платёжную сессию…")
+
     try:
-        # stripe python sdk — синхронный, вызываем в thread
+        # создаём сессию в фоновом потоке (если STRIPE_SECRET_KEY не задан — выбросится)
         url = await asyncio.to_thread(create_checkout_session_sync, user_id)
-        await callback.message.answer(
-            f"Откройте ссылку для оплаты (checkout):\n\n{url}\n\nПосле успешной оплаты вы получите Premium автоматически."
+
+        # кнопка с URL (Откроет Checkout)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="💳 Оплатить (Stripe)", url=url)
+        builder.adjust(1)
+
+        text = (
+            "🔒 Оплата проходит через Stripe.\n\n"
+            "Нажмите кнопку ниже — вас перенесёт на безопасную страницу оплаты."
         )
+
+        await callback.message.answer(text, reply_markup=builder.as_markup())
+
     except Exception as e:
-        logging.exception(f"Failed to create stripe session: {e}")
-        await callback.message.answer("⚠️ Не удалось создать платёжную сессию. Проверьте настройки Stripe.")
-    await callback.answer()
+        logging.exception("Failed to create stripe session: %s", e)
+        # более дружелюбный текст ошибки для пользователя
+        await callback.message.answer(
+            "⚠️ Не удалось создать платёжную сессию. Проверьте настройки Stripe (STRIPE_SECRET_KEY / PRICE / DOMAIN)."
+        )
 
 
-@dp.callback_query(F.data == "activate_premium")
-async def activate_premium(callback: types.CallbackQuery):
-    """Временная ручная активация Premium."""
-    until_date = (datetime.now() + timedelta(days=30)).isoformat()
-    update_user(callback.from_user.id, is_premium=1, premium_until=until_date)
-    await callback.message.answer("✅ Premium активирован на 30 дней! 💎")
-    await callback.answer()
+#@dp.callback_query(F.data == "activate_premium")
+#async def activate_premium(callback: types.CallbackQuery):
+#   """Временная ручная активация Premium."""
+#    until_date = (datetime.now() + timedelta(days=30)).isoformat()
+#    update_user(callback.from_user.id, is_premium=1, premium_until=until_date)
+#    await callback.message.answer("✅ Premium активирован на 30 дней! 💎")
+#    await callback.answer()
 
 # ======================================
 # 📦 Безопасная загрузка файла с Telegram
@@ -518,6 +536,12 @@ def create_checkout_session_sync(user_id: int):
             success_url=success_url,
             cancel_url=cancel_url,
             metadata=metadata,
+            # ВАЖНО: кладём user_id в метадату подписки
+            subscription_data={
+                "metadata": {
+                    "user_id": str(user_id)
+                }
+            },
         )
     else:
         # Разовый платёж $7.99
@@ -548,46 +572,110 @@ async def stripe_webhook(request: web.Request):
     payload = await request.read()
     sig_header = request.headers.get("Stripe-Signature", "")
 
-    # Подписка должна быть настроена в Stripe: endpoint -> /stripe/webhook
+    # Проверяем подпись (если есть вебхук-секрет)
     if STRIPE_WEBHOOK_SECRET:
         try:
             event = stripe.Webhook.construct_event(
-                payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET
+                payload=payload,
+                sig_header=sig_header,
+                secret=STRIPE_WEBHOOK_SECRET,
             )
-        except ValueError as e:
-            logging.warning(f"Stripe webhook invalid payload: {e}")
-            return web.Response(status=400)
-        except stripe.error.SignatureVerificationError as e:
-            logging.warning(f"Stripe webhook signature error: {e}")
+        except (ValueError, stripe.error.SignatureVerificationError):
+            logging.warning("Stripe webhook signature/parse error")
             return web.Response(status=400)
     else:
-        # Если нет секретного ключа — просто парсим JSON (не безопасно, только для локального теста)
         try:
             event = json.loads(payload)
-        except Exception as e:
-            logging.warning(f"Stripe webhook parse error (no secret): {e}")
+        except Exception:
+            logging.warning("Stripe webhook parse error (no secret)")
             return web.Response(status=400)
 
-    try:
-        etype = event["type"] if isinstance(event, dict) else event.get("type")
-        if etype == "checkout.session.completed":
-            session = event["data"]["object"]
-            user_id = session.get("metadata", {}).get("user_id")
-            if user_id:
-                # Ставим Premium на 30 дней — простая логика
-                until_date = (datetime.now() + timedelta(days=30)).isoformat()
-                try:
-                    update_user(int(user_id), is_premium=1, premium_until=until_date)
-                    logging.info(f"Activated premium for user {user_id} until {until_date}")
-                except Exception as e:
-                    logging.exception(f"Failed to activate premium for {user_id}: {e}")
+    etype = event.get("type") if isinstance(event, dict) else event["type"]
+    obj = event.get("data", {}).get("object", {}) if isinstance(event, dict) else event.data["object"]
 
-        # Опционально: подписки — продление по invoice.payment_succeeded
-        if etype == "invoice.payment_succeeded":
-            invoice = event["data"]["object"]
-            # можно продлевать premium по subscription (если хотите точнее — используйте subscription status)
-    except Exception as e:
-        logging.exception(f"Error handling stripe event: {e}")
+    try:
+        # 1) Первая успешная оплата через Checkout
+        if etype == "checkout.session.completed":
+            session = obj
+            sub_id = session.get("subscription")
+            metadata = session.get("metadata") or {}
+            user_id = metadata.get("user_id")
+
+            if sub_id and user_id:
+                sub = stripe.Subscription.retrieve(sub_id)
+                period_end_ts = sub.get("current_period_end")
+                if period_end_ts:
+                    until = datetime.fromtimestamp(int(period_end_ts))
+
+                    # если уже есть более дальняя дата — не укорачиваем
+                    old = get_user(int(user_id))[4]
+                    if old:
+                        try:
+                            old_dt = datetime.fromisoformat(old)
+                            if old_dt > until:
+                                until = old_dt
+                        except Exception:
+                            pass
+
+                    update_user(int(user_id), is_premium=1, premium_until=until.isoformat())
+                    logging.info(f"Activated premium for user {user_id} until {until}")
+
+        # 2) Продление подписки (каждый успешный платеж)
+        elif etype == "invoice.payment_succeeded":
+            invoice = obj
+            sub_id = invoice.get("subscription")
+            if sub_id:
+                sub = stripe.Subscription.retrieve(sub_id)
+                period_end_ts = sub.get("current_period_end")
+
+                # user_id ищем в metadata подписки или инвойса
+                user_id = None
+                if sub.get("metadata", {}).get("user_id"):
+                    user_id = sub["metadata"]["user_id"]
+                elif invoice.get("metadata", {}).get("user_id"):
+                    user_id = invoice["metadata"]["user_id"]
+
+                if user_id and period_end_ts:
+                    until = datetime.fromtimestamp(int(period_end_ts))
+
+                    old = get_user(int(user_id))[4]
+                    if old:
+                        try:
+                            old_dt = datetime.fromisoformat(old)
+                            if old_dt > until:
+                                until = old_dt
+                        except Exception:
+                            pass
+
+                    update_user(int(user_id), is_premium=1, premium_until=until.isoformat())
+                    logging.info(f"Renewed premium for user {user_id} until {until}")
+
+        # 3) Отмена / изменение подписки
+        elif etype in ("customer.subscription.updated", "customer.subscription.deleted"):
+            sub = obj
+            sub_full = stripe.Subscription.retrieve(sub.get("id"))
+
+            user_id = sub_full.get("metadata", {}).get("user_id")
+            status = sub_full.get("status")
+            cancel_at_period_end = sub_full.get("cancel_at_period_end")
+            period_end_ts = sub_full.get("current_period_end")
+
+            if not user_id:
+                return web.Response(status=200)
+
+            # отменили сразу (без «действует до конца периода»)
+            if status == "canceled" and not cancel_at_period_end:
+                update_user(int(user_id), is_premium=0, premium_until=None)
+                logging.info(f"Premium revoked immediately for user {user_id}")
+            else:
+                # отмена в конце периода — держим до current_period_end
+                if period_end_ts:
+                    until = datetime.fromtimestamp(int(period_end_ts)).isoformat()
+                    update_user(int(user_id), is_premium=1, premium_until=until)
+                    logging.info(f"Premium for user {user_id} active until period end {until}")
+
+    except Exception:
+        logging.exception("Error handling Stripe event")
         return web.Response(status=500)
 
     return web.Response(status=200)
@@ -610,6 +698,16 @@ async def start_stripe_webserver(host="0.0.0.0", port=8080):
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_any_text(message: types.Message):
     user_key = str(message.from_user.id)
+
+    # ----- Admin secret premium -----
+    secret = os.getenv("ADMIN_PREMIUM_CODE", "")
+    if secret and message.text.strip() == secret:
+        until = (datetime.now() + timedelta(days=30)).isoformat()
+        update_user(message.from_user.id, is_premium=1, premium_until=until)
+        await message.answer("✅ Админ-Premium активирован на 30 дней.")
+        return
+    # --------------------------------
+
     wf = dp.workflow_data.get(user_key)
 
     # Если пользователь сейчас пишет отзыв / сотрудничество
@@ -1174,7 +1272,6 @@ async def send_summaries():
                         parse_mode="Markdown"
                     )
         await asyncio.sleep(600)
-
 
 # ======================================
 # ▶️ Запуск TasteBalance
