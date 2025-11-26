@@ -447,16 +447,34 @@ async def buy_premium(callback: types.CallbackQuery):
     """
     Создаём Stripe Checkout и отправляем пользователю одно сообщение
     с кнопкой "💳 Оплатить (Stripe)" — сразу открывает checkout.
-    Убираем промежуточное сообщение «Создаю платёжную сессию…».
+
+    Защита от двойной подписки:
+    - если Premium уже активен (по нашей БД), новую оплату не предлагаем.
     """
     await callback.answer()  # быстро закрываем «spinner» у Telegram (без текста)
     user_id = callback.from_user.id
 
+    # 1) Уже активный Premium — не даём оформить ещё раз
+    if is_premium_active(user_id):
+        user = get_user(user_id)
+        premium_until = user[4]  # premium_until хранится в users[4]
+
+        text = "💎 У тебя уже активен Premium."
+        if premium_until:
+            try:
+                dt = datetime.fromisoformat(premium_until)
+                text += f"\n\nОн действует до: *{dt.strftime('%d.%m.%Y %H:%M')}*"
+            except Exception:
+                pass
+
+        text += "\n\nОплачивать ещё раз сейчас не нужно 🚫."
+        await callback.message.answer(text, parse_mode="Markdown")
+        return
+
+    # 2) Premium не активен — создаём Stripe Checkout
     try:
-        # создаём сессию в фоновом потоке (если STRIPE_SECRET_KEY не задан — выбросится)
         url = await asyncio.to_thread(create_checkout_session_sync, user_id)
 
-        # кнопка с URL (Откроет Checkout)
         builder = InlineKeyboardBuilder()
         builder.button(text="💳 Оплатить (Stripe)", url=url)
         builder.adjust(1)
@@ -470,9 +488,9 @@ async def buy_premium(callback: types.CallbackQuery):
 
     except Exception as e:
         logging.exception("Failed to create stripe session: %s", e)
-        # более дружелюбный текст ошибки для пользователя
         await callback.message.answer(
-            "⚠️ Не удалось создать платёжную сессию. Проверьте настройки Stripe (STRIPE_SECRET_KEY / PRICE / DOMAIN)."
+            "⚠️ Не удалось создать платёжную сессию. "
+            "Обратитесь к Автору через кнопку 'Отправить Отзыв или Сотрудничество'"
         )
 
 
