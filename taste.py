@@ -136,6 +136,15 @@ def save_meal(user_id, desc, kcal, p, f, c):
     )
     conn.commit()
 
+def delete_full_meal(user_id, meal_id: int) -> bool:
+    """Удалить одно блюдо пользователя по id. Возвращает True, если что-то удалили."""
+    cursor.execute(
+        "DELETE FROM meals WHERE id=? AND user_id=?",
+        (meal_id, user_id)
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
 
 def get_stats(user_id):
     """Получить статистику за текущий день."""
@@ -225,6 +234,15 @@ ANALYSIS_PROMPT = """
 - Для каждого ингредиента оцени примерный вес (целое число).
 - Рассчитай КБЖУ (калории, белки, жиры, углеводы) максимально реалистично.
 - Не пиши лишний текст, комментарии и описания.
+- Если пользователь/контекст указывают количество в штуках (1 шт., 2 яйца, 3 банана и т.п.), переводи в граммы по типичным средним весам:
+  * 1 яичный белок ≈ 33 г
+  * 1 целое яйцо (среднее) ≈ 55 г
+  * 1 большое яйцо ≈ 65 г
+  * 1 банан (средний) ≈ 120 г
+  * 1 ломтик хлеба ≈ 30 г
+  * 1 кусочек твёрдого сыра ≈ 25 г
+- Если размер не указан (просто «яйцо», «банан»), используй средний вариант.
+- Всегда указывай итоговый вес ингредиентов в граммах в поле "weight_g".
 
 📋 Формат ответа строго:
 {
@@ -232,7 +250,7 @@ ANALYSIS_PROMPT = """
     {"name": "курица", "weight_g": 150, "cal": 230, "protein": 32, "fat": 5, "carbs": 0},
     {"name": "рис", "weight_g": 200, "cal": 260, "protein": 6, "fat": 2, "carbs": 56}
   ],
-  "total": {"cal": 490, "protein": 38, "fat": 7, "carbs": 56}
+    "total": {"cal": 490, "protein": 38, "fat": 7, "carbs": 56}
 }
 """
 
@@ -289,7 +307,7 @@ async def stats_cmd(message: types.Message):
         )
     else:
         text = "🫙 Сегодня ещё ничего не добавлено."
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode="Markdown", reply_markup=main_menu())
 
 
 # ======================================
@@ -299,9 +317,9 @@ async def stats_cmd(message: types.Message):
 @dp.message(Command("history"))
 @dp.message(F.text == "🕒 История")
 async def history_cmd(message: types.Message):
-    """Показать историю за последние 7 дней с временем и ингредиентами."""
+    """Показать историю за последние 7 дней и дать возможность удалить записи."""
     cursor.execute(
-        "SELECT date, time, description, calories, protein, fat, carbs "
+        "SELECT id, date, time, description, calories, protein, fat, carbs "
         "FROM meals WHERE user_id=? AND date>=? "
         "ORDER BY date DESC, time DESC",
         (message.from_user.id, (date.today() - timedelta(days=7)).isoformat())
@@ -309,24 +327,41 @@ async def history_cmd(message: types.Message):
     rows = cursor.fetchall()
 
     if not rows:
-        await message.answer("📭 История пуста за последние 7 дней.")
+        await message.answer("📭 История пуста за последние 7 дней.", reply_markup=main_menu())
         return
 
     text = "🕒 *История за 7 дней:*\n\n"
-    for d, t, desc, kcal, p, f, c in rows:
+    for meal_id, d, t, desc, kcal, p, f, c in rows:
         date_part = f"📅 {d}"
-        #time_part = f"🕐 {t}" if t else ""
+        # time_part = f"🕐 {t}" if t else ""
         ingredients = desc.replace("Фото еды", "📷 Фото блюда")
 
         text += (
-            #{time_part} to show time
             f"{date_part}\n"
             f"🍽️ {ingredients}\n"
             f"🔥 {round(kcal)} ккал — "
             f"Б: {round(p)} Ж: {round(f)} У: {round(c)}\n\n"
         )
 
-    await message.answer(text.strip(), parse_mode="Markdown")
+    # Инлайн-кнопки для удаления (ограничим, скажем, 15 последними записями, чтобы не раздувать клавиатуру)
+    builder = InlineKeyboardBuilder()
+    for meal_id, d, t, desc, *_ in rows[:15]:
+        short = desc.split(",")[0][:20]  # короткое название
+        label_time = t or ""
+        builder.button(
+            text=f"🗑 {d} {label_time} · {short}",
+            callback_data=f"delete_full_meal:{meal_id}"
+        )
+    if rows:
+        builder.adjust(1)
+
+    text += "Чтобы удалить запись, нажми на кнопку 🗑 ниже ⬇️"
+
+    await message.answer(
+        text.strip(),
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup() if rows else main_menu()
+    )
 
 # ======================================
 # ℹ️ /help — справка
@@ -338,6 +373,7 @@ async def help_cmd(message: types.Message):
     text = (
         "ℹ️ *TasteBalance — твой AI-ассистент по питанию!*\n\n"
         "📸 Просто отправь фото еды или напиши блюдо — я определю состав и КБЖУ.\n\n"
+        "💡 Для максимальной точности пиши вес в граммах. Формат \"2 яйца, 1 банан\" я тоже понимаю — это будет средний размер.\n\n"
         "🆓 *Бесплатно:* 2 фото в день\n"
         "💎 *Premium:* безлимит, улучшенная точность и автоотчёты\n\n"
         "📋 *Команды:*\n"
@@ -360,14 +396,15 @@ async def manual_input(message: types.Message):
     dp.workflow_data[user_id] = {"mode": "manual_input"}
 
     await message.answer(
-        "📝 Введи блюдо текстом, например:\n\n"
-        "_овсянка с молоком 100г и бананом 50г_\n"
-        "_или же просто напиши:_\n"
-        "_курица с рисом и овощами_\n\n"
-        "✨ Я рассчитаю состав и КБЖУ максимально точно.",
-        parse_mode="Markdown"
-    )
-
+    "📝 Введи блюдо текстом, например:\n\n"
+    "_овсянка с молоком 100г и бананом 50г_\n"
+    "_или же просто напиши:_\n"
+    "_курица с рисом и овощами_\n\n"
+    "✨ Для максимальной точности указывай вес в граммах.\n"
+    "Формат вроде _\"3 яйца\", \"2 банана\"_ я тоже понимаю — я переведу их в средний вес.",
+    parse_mode="Markdown"
+)
+    
 # ======================================
 # 💬 Отзывы и сотрудничество
 # ======================================
@@ -818,7 +855,7 @@ async def handle_any_text(message: types.Message):
         return
 
         # --- изменение названия ингредиента с пересчётом ---
-    if wf.get("stage") == "await_name":
+    if wf and wf.get("stage") == "await_name":
         new_name = message.text.strip()
         idx = wf.get("editing_index")
 
@@ -909,7 +946,7 @@ async def handle_any_text(message: types.Message):
 
 
     # --- изменение веса ---
-    if wf.get("stage") == "await_weight":
+    if wf and wf.get("stage") == "await_weight":
         try:
             new_weight = float(message.text.strip())
             idx = wf.get("editing_index")
@@ -965,51 +1002,76 @@ async def handle_any_text(message: types.Message):
         await message.answer("🍽️ Анализирую блюдо...")
 
         try:
-            model = "gemini-2.5-flash" if is_premium_active(message.from_user.id) else "gemini-2.5-flash-lite"
-            gen_model = genai.GenerativeModel(model)
+            cache_key = f"text:{user_text.strip().lower()}"
+            cached = cache_get(cache_key)
 
-            # 🧠 Промпт для Gemini
-            prompt = f"""
-            Ты — эксперт по питанию. Пользователь описал блюдо:
-            "{user_text}"
-
-            Определи ингредиенты, примерный вес и рассчитай КБЖУ.
-            Ответ строго в JSON формате, как в примере:
-
-            {{
-            "items": [
-                {{"name": "курица", "weight_g": 150, "cal": 230, "protein": 32, "fat": 5, "carbs": 0}},
-                {{"name": "рис", "weight_g": 200, "cal": 260, "protein": 6, "fat": 2, "carbs": 56}}
-            ],
-            "total": {{"cal": 490, "protein": 38, "fat": 7, "carbs": 56}}
-            }}
-            """
-
-            # --- Отправляем запрос в Gemini ---
-            response = await asyncio.to_thread(gen_model.generate_content, [prompt])
-
-            # ✅ Универсальный способ извлечь текст из ответа Gemini
-            if hasattr(response, "text") and response.text:
-                result = response.text.strip()
-            elif hasattr(response, "candidates"):
-                try:
-                    result = response.candidates[0].content.parts[0].text.strip()
-                except Exception:
-                    result = ""
+            if cached:
+                # Берём уже готовый JSON из кэша
+                cleaned = cached
             else:
-                result = str(response).strip()
+                model = "gemini-2.5-flash" if is_premium_active(message.from_user.id) else "gemini-2.5-flash-lite"
+                gen_model = genai.GenerativeModel(model)
 
-            # 🧹 Очистка и попытка вытащить JSON
-            cleaned = result.replace("```json", "").replace("```", "").strip()
+                # 🧠 Промпт для Gemini
+                prompt = f"""
+                Ты — эксперт по питанию. Пользователь описал блюдо:
+                "{user_text}"
 
-            if not cleaned.startswith("{"):
-                match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-                cleaned = match.group(0) if match else "{}"
+                Твоя задача — разобрать блюдо на отдельные ингредиенты, оценить их вес и рассчитать КБЖУ.
+
+                Правила:
+                - Определи ингредиенты, примерный вес и рассчитай КБЖУ.
+                - Не выдумывай продукты, которых явно нет.
+                - Если количество указано в штуках (шт., штук, яйца, банана, кусочка и т.п.), переводи в граммы по типичным средним весам:
+                  * 1 яичный белок ≈ 33 г
+                  * 1 целое яйцо (среднее) ≈ 55 г
+                  * 1 большое яйцо ≈ 65 г
+                  * 1 банан (средний) ≈ 120 г
+                  * 1 ломтик хлеба ≈ 30 г
+                  * 1 кусочек твёрдого сыра ≈ 25 г
+                - Если размер не указан (просто "яйцо", "банан"), используй средний вариант.
+                - Всегда указывай вес каждого ингредиента в граммах в поле "weight_g".
+                - Не добавляй комментариев, только JSON.
+
+                Ответ строго в JSON формате, как в примере:
+
+                {{
+                  "items": [
+                    {{"name": "курица", "weight_g": 150, "cal": 230, "protein": 32, "fat": 5, "carbs": 0}},
+                    {{"name": "рис", "weight_g": 200, "cal": 260, "protein": 6, "fat": 2, "carbs": 56}}
+                  ],
+                  "total": {{"cal": 490, "protein": 38, "fat": 7, "carbs": 56}}
+                }}
+                """
+
+                # --- Отправляем запрос в Gemini ---
+                response = await asyncio.to_thread(gen_model.generate_content, [prompt])
+
+                # ✅ Универсальный способ извлечь текст из ответа Gemini
+                if hasattr(response, "text") and response.text:
+                    result = response.text.strip()
+                elif hasattr(response, "candidates"):
+                    try:
+                        result = response.candidates[0].content.parts[0].text.strip()
+                    except Exception:
+                        result = ""
+                else:
+                    result = str(response).strip()
+
+                # 🧹 Очистка и попытка вытащить JSON
+                cleaned = result.replace("```json", "").replace("```", "").strip()
+
+                if not cleaned.startswith("{"):
+                    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+                    cleaned = match.group(0) if match else "{}"
+
+                # Кладём в кэш уже очищенный JSON
+                cache_set(cache_key, cleaned)
 
             try:
                 data = json.loads(cleaned)
             except Exception as e:
-                logging.warning(f"⚠️ Ошибка парсинга JSON Gemini: {e}\nОтвет: {result}")
+                logging.warning(f"⚠️ Ошибка парсинга JSON Gemini: {e}\nОтвет: {cleaned}")
                 data = {"items": [], "total": {}}
 
             items, total = data.get("items", []), data.get("total", {})
@@ -1022,10 +1084,24 @@ async def handle_any_text(message: types.Message):
             kcal = total.get("cal", 0)
             p, f, c = total.get("protein", 0), total.get("fat", 0), total.get("carbs", 0)
 
-            text = "🍽️ *Анализ блюда:*\n" + "\n".join(
-                [f"- {i['name']} ({i['weight_g']} г)" for i in items]
+            lines = []
+            for i in items:
+                name = i.get("name", "—")
+                w = i.get("weight_g", 0)
+                cal_i = i.get("cal", 0)
+                pr = i.get("protein", 0)
+                fat_i = i.get("fat", 0)
+                carb_i = i.get("carbs", 0)
+                lines.append(
+                    f"- {name} ({round(w)} г) — {round(cal_i)} ккал, "
+                    f"Б: {round(pr)} г  Ж: {round(fat_i)} г  У: {round(carb_i)} г"
+                )
+
+            text = "🍽️ *Анализ блюда:*\n" + "\n".join(lines)
+            text += (
+                f"\n\n🔥 *Итого:* {round(kcal)} ккал\n"
+                f"Б: {round(p)} г  Ж: {round(f)} г  У: {round(c)} г"
             )
-            text += f"\n\n🔥 *Итого:* {round(kcal)} ккал\nБ: {round(p)} г  Ж: {round(f)} г  У: {round(c)} г"
 
             builder = InlineKeyboardBuilder()
             builder.button(text="✏️ Изменить ингредиент", callback_data="edit_meal")
@@ -1041,6 +1117,7 @@ async def handle_any_text(message: types.Message):
             logging.error(f"Ошибка анализа текста: {e}")
             await message.answer("⚠️ Ошибка анализа текста. Попробуй снова.")
             return
+
 
     # Если ни один режим не активен
     await message.answer("⚙️ Пожалуйста, выбери действие из меню 👇", reply_markup=main_menu())
@@ -1070,43 +1147,52 @@ async def handle_photo(message: types.Message):
         await message.answer("⚠️ Не удалось загрузить фото. Проверь соединение и попробуй снова.")
         return
 
-    # лимит фото
+    # лимит фото (считаем даже если попадём в кэш — чтобы не спамили одно и то же фото)
     try:
         increment_photo(message.from_user.id)
     except Exception:
         logging.exception("Ошибка increment_photo")
 
     try:
-        model = "gemini-2.5-flash" if is_premium_active(message.from_user.id) else "gemini-2.5-flash-lite"
-        gen_model = genai.GenerativeModel(model)
+        # ключ для кэша по содержимому картинки
+        cache_key = "img:" + base64.b64encode(image_bytes).decode("ascii")
+        cached = cache_get(cache_key)
 
-        response = await asyncio.to_thread(gen_model.generate_content, [ANALYSIS_PROMPT, {"mime_type": "image/jpeg", "data": image_bytes}])
-
-        # ✅ Проверяем разные варианты, как Gemini возвращает ответ
-        if hasattr(response, "text") and response.text:
-            result = response.text.strip()
-        elif hasattr(response, "candidates"):
-            try:
-                result = response.candidates[0].content.parts[0].text.strip()
-            except Exception:
-                result = ""
+        if cached:
+            cleaned = cached
         else:
-            result = str(response).strip()
-        if result.startswith("```"):
-            result = result.replace("```json", "").replace("```", "").strip()
+            model = "gemini-2.5-flash" if is_premium_active(message.from_user.id) else "gemini-2.5-flash-lite"
+            gen_model = genai.GenerativeModel(model)
 
-        # 🧠 Безопасно обрабатываем ответ Gemini
-        if not result or not isinstance(result, str):
-            await message.answer("⚠️ Gemini не смог распознать фото. Попробуй другое изображение или более чёткое фото.")
-            return
+            response = await asyncio.to_thread(
+                gen_model.generate_content,
+                [ANALYSIS_PROMPT, {"mime_type": "image/jpeg", "data": image_bytes}]
+            )
 
-        # 🧹 Если Gemini вернул Markdown — чистим от ```json
-        cleaned = result.replace("```json", "").replace("```", "").strip()
+            # ✅ Проверяем разные варианты, как Gemini возвращает ответ
+            if hasattr(response, "text") and response.text:
+                result = response.text.strip()
+            elif hasattr(response, "candidates"):
+                try:
+                    result = response.candidates[0].content.parts[0].text.strip()
+                except Exception:
+                    result = ""
+            else:
+                result = str(response).strip()
 
-        # ⚙️ Если ответ не похож на JSON — пытаемся вытащить JSON из текста
-        if not cleaned.startswith("{"):
-            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            cleaned = match.group(0) if match else "{}"
+            if result.startswith("```"):
+                result = result.replace("```json", "").replace("```", "").strip()
+
+            # 🧹 Если Gemini вернул Markdown — чистим от ```json
+            cleaned = result.replace("```json", "").replace("```", "").strip()
+
+            # ⚙️ Если ответ не похож на JSON — пытаемся вытащить JSON из текста
+            if not cleaned.startswith("{"):
+                match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+                cleaned = match.group(0) if match else "{}"
+
+            # Кладём в кэш уже очищенный JSON
+            cache_set(cache_key, cleaned)
 
         try:
             data = json.loads(cleaned)
@@ -1115,7 +1201,6 @@ async def handle_photo(message: types.Message):
             await message.answer("⚠️ Не удалось обработать ответ Gemini. Попробуй другое фото.")
             return
 
-        # ✅ ВОТ ЭТИ 2 СТРОКИ НУЖНО ДОБАВИТЬ
         items = data.get("items", [])
         total = data.get("total", {})
 
@@ -1130,8 +1215,21 @@ async def handle_photo(message: types.Message):
 
         text = "🍽️ *Обнаружено:*\n"
         for i in items:
-            text += f"- {i.get('name', '—')} ({i.get('weight_g', 0)} г)\n"
-        text += f"\n🔥 *Итого:* {round(kcal)} ккал\nБ: {round(p)} г  Ж: {round(f)} г  У: {round(c)} г"
+            name = i.get("name", "—")
+            w = i.get("weight_g", 0)
+            cal_i = i.get("cal", 0)
+            pr = i.get("protein", 0)
+            fat_i = i.get("fat", 0)
+            carb_i = i.get("carbs", 0)
+            text += (
+                f"- {name} ({round(w)} г) — {round(cal_i)} ккал, "
+                f"Б: {round(pr)} г  Ж: {round(fat_i)} г  У: {round(carb_i)} г\n"
+            )
+
+        text += (
+            f"\n🔥 *Итого:* {round(kcal)} ккал\n"
+            f"Б: {round(p)} г  Ж: {round(f)} г  У: {round(c)} г"
+        )
 
         builder = InlineKeyboardBuilder()
         builder.button(text="✏️ Изменить ингредиент", callback_data="edit_meal")
@@ -1140,14 +1238,13 @@ async def handle_photo(message: types.Message):
             builder.button(text="💎 Получить Premium", callback_data="buy_premium")
         builder.adjust(2)
 
-
         await message.answer(text, parse_mode="Markdown", reply_markup=builder.as_markup())
-
         dp.workflow_data[str(message.from_user.id)] = {"meal": {"items": items, "total": total}}
 
     except Exception as e:
         logging.error(f"Ошибка анализа Gemini: {e}")
         await message.answer("⚠️ Ошибка анализа фото. Попробуй снова.")
+
 
 # ======================================
 # 💎 Premium-заглушки и обработка кнопок
@@ -1189,6 +1286,25 @@ async def handle_meal_actions(callback: types.CallbackQuery):
         await save_meal_to_stats(callback)
     else:
         await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_full_meal:"))
+async def delete_full_meal_callback(callback: types.CallbackQuery):
+        """Удаление записи из истории/статистики по кнопке 🗑 из /history."""
+        try:
+            meal_id_str = callback.data.split(":", 1)[1]
+            meal_id = int(meal_id_str)
+        except (IndexError, ValueError):
+            await callback.answer("Ошибка удаления.", show_alert=False)
+            return
+
+        ok = delete_full_meal(callback.from_user.id, meal_id)
+        if ok:
+            await callback.message.answer("🗑 Запись удалена из статистики и истории.")
+        else:
+            await callback.message.answer("⚠️ Не удалось удалить запись (возможно, она уже удалена).")
+
+        await callback.answer()
+
 
 # ======================================
 # ✏️ Редактирование ингредиентов
@@ -1297,10 +1413,19 @@ async def show_updated_meal(user_id):
     total = {k: round(v, 2) for k, v in total.items()}
     wf["meal"]["total"] = total
 
-
     text = "🍽️ *Обновлённое блюдо:*\n"
     for i in items:
-        text += f"- {i['name']} ({i['weight_g']} г)\n"
+        name = i.get("name", "—")
+        w = i.get("weight_g", 0)
+        cal_i = i.get("cal", 0)
+        pr = i.get("protein", 0)
+        fat_i = i.get("fat", 0)
+        carb_i = i.get("carbs", 0)
+        text += (
+            f"- {name} ({round(w)} г) — {round(cal_i)} ккал, "
+            f"Б: {round(pr)} г  Ж: {round(fat_i)} г  У: {round(carb_i)} г\n"
+        )
+
     text += (
         f"\n🔥 *Итого:* {round(total['cal'])} ккал\n"
         f"Б: {round(total['protein'])} г  "
@@ -1338,7 +1463,11 @@ async def save_meal_to_stats(callback: types.CallbackQuery):
     desc = ", ".join([i["name"] for i in wf["meal"]["items"]])
     save_meal(callback.from_user.id, desc, kcal, p, f, c)
 
-    await callback.message.answer("✅ Блюдо успешно добавлено в статистику за сегодня!")
+    await callback.message.answer(
+        "✅ Блюдо успешно добавлено в статистику за сегодня!\n\n"
+        "Можешь продолжить — выбери действие из меню 👇",
+        reply_markup=main_menu()
+    )
     await callback.answer()
 
 # ======================================
