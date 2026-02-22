@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardButton
 from dotenv import load_dotenv
 import google.generativeai as genai
 load_dotenv()
@@ -39,6 +40,13 @@ dp.workflow_data = {}
 
 genai.configure(api_key=GEMINI_API_KEY)
 logging.basicConfig(level=logging.INFO)
+
+ACTIVITY_LEVELS = {
+    "low": ("Сидячий", 1.2),
+    "medium": ("Лёгкая активность", 1.375),
+    "high": ("Умеренная активность", 1.55),
+    "very_high": ("Высокая активность", 1.725)
+}
 
 # ========== Stripe & aiohttp для webhook ==========
 import stripe
@@ -92,14 +100,16 @@ CREATE TABLE IF NOT EXISTS users(
     last_date TEXT,
     photos_today INTEGER DEFAULT 0,
     premium_until TEXT,
-    language TEXT DEFAULT 'ru',
-    rmr REAL,
-    protein_goal INTEGER,
-    carbs_min INTEGER,
-    carbs_max INTEGER,
-    fat_limit INTEGER,
-    fibre_goal INTEGER,
-    activity_calories INTEGER
+    gender TEXT,
+    age INTEGER,
+    weight_kg REAL,
+    height_cm REAL,
+    goal TEXT,
+    activity_level REAL DEFAULT 1.375,
+    custom_calories INTEGER,
+    custom_protein REAL,
+    custom_fat REAL,
+    custom_carbs REAL
 )
 """)
 
@@ -160,7 +170,10 @@ def get_stats(user_id):
         "SELECT SUM(calories), SUM(protein), SUM(fat), SUM(carbs) FROM meals WHERE user_id=? AND date=?",
         (user_id, date.today().isoformat())
     )
-    return cursor.fetchone() or (0, 0, 0, 0)
+    row = cursor.fetchone()
+    if row is None:
+        return (0.0, 0.0, 0.0, 0.0)
+    return tuple(v or 0.0 for v in row)
 
 
 def get_user(user_id):
@@ -168,23 +181,19 @@ def get_user(user_id):
     cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
     user = cursor.fetchone()
     if not user:
-        cursor.execute(
-            "INSERT INTO users (user_id, is_premium, last_date, photos_today, premium_until, language) VALUES (?, 0, ?, 0, NULL, 'ru')",
-            (user_id, date.today().isoformat())
+        cursor.execute("""
+                INSERT INTO users (
+                    user_id, is_premium, last_date, photos_today, premium_until,
+                    gender, age, weight_kg, height_cm
+                ) VALUES (?, 0, ?, 0, NULL, NULL, NULL, NULL, NULL)
+        """, (user_id, date.today().isoformat())
         )
         conn.commit()
-        return (user_id, 0, date.today().isoformat(), 0, None, 'ru')
+        return (user_id, 0, date.today().isoformat(), 0, None)
     return user
 
 
-def get_user_lang(user_id):
-    """Получить язык пользователя."""
-    user = get_user(user_id)
-    return user[5] if len(user) > 5 else 'ru'
-
-
 def update_user(user_id, **fields):
-    """Обновить данные пользователя."""
     set_clause = ", ".join([f"{k}=?" for k in fields.keys()])
     cursor.execute(f"UPDATE users SET {set_clause} WHERE user_id=?", (*fields.values(), user_id))
     conn.commit()
@@ -228,11 +237,46 @@ def can_analyze_photo(user_id):
     if photos_today >= 2:
         return False, (
             "📸 Сегодня лимит 2 фото.\n\n"
-            "💎 *TasteBalance Premium* — без ограничений и с точным анализом.\n"
+            "💎 *TasteBalance Premium* — без ограничений и с более точным анализом.\n"
             "Нажми «Получить Premium» ниже 👇"
         )
     return True, None
 
+def calculate_rmr(gender: str, age: int, weight_kg: float, height_cm: float) -> float:
+    if gender == "male":
+        return 10 * weight_kg + 6.25 * height_cm - 5 * age + 5
+    elif gender == "female":
+        return 10 * weight_kg + 6.25 * height_cm - 5 * age - 161
+    else:
+        raise ValueError("Invalid gender")
+
+def calculate_macros(rmr: float, activity_level: float, goal: str) -> dict:
+    """Возвращает словарь с калориями и макронутриентами."""
+    tdee = rmr * activity_level
+    if goal == "deficit":
+        calories = round(tdee * 0.85)
+        protein_g = round(2.2 * (rmr / 10))  # ~2.2 г/кг идеального веса
+        fat_g = round(calories * 0.25 / 9)
+        carbs_g = round((calories - protein_g * 4 - fat_g * 9) / 4)
+    elif goal == "surplus":
+        calories = round(tdee * 1.10)
+        protein_g = round(2.0 * (rmr / 10))
+        fat_g = round(calories * 0.30 / 9)
+        carbs_g = round((calories - protein_g * 4 - fat_g * 9) / 4)
+    else:  # maintenance
+        calories = round(tdee)
+        protein_g = round(2.0 * (rmr / 10))
+        fat_g = round(calories * 0.28 / 9)
+        carbs_g = round((calories - protein_g * 4 - fat_g * 9) / 4)
+
+    # Защита от отрицательных значений
+    carbs_g = max(carbs_g, 0)
+    return {
+        "calories": calories,
+        "protein": protein_g,
+        "fat": fat_g,
+        "carbs": carbs_g
+    }
 
 # ======================================
 # 🔮 Промпт для анализа изображения
@@ -269,164 +313,27 @@ ANALYSIS_PROMPT = """
 """
 
 # ======================================
-# 🌐 Языковая поддержка
-# ======================================
-
-LANG = {
-    "ru": {
-        "main_menu_btn": "👋 Главное меню",
-        "nutrition_report_btn": "📊 Отчёт по целям",
-        "greeting": "👋 Привет, {first_name}!\n\nЯ — *TasteBalance*, твой AI-ассистент по питанию 🍽️\n\n💎 *Статус:* {status}\n\n📸 Просто отправь фото еды или напиши, что ты ел — я определю состав и КБЖУ.\n\nИли выбери действие из меню: 👇",
-        "stats_today": "📈 *Сегодняшний результат:*\n🔥 Калории: {kcal} ккал\n🍗 Белки: {p} г\n🥑 Жиры: {f} г\n🍞 Углеводы: {c} г",
-        "stats_empty": "🫙 Сегодня ещё ничего не добавлено.",
-        "history_empty": "📭 История пуста за последние 7 дней.",
-        "history_title": "🕒 *История за 7 дней:*\n\n",
-        "history_item": "{date_part}\n🍽️ {ingredients}\n🔥 {kcal} ккал — Б: {p} Ж: {f} У: {c}\n\n",
-        "delete_prompt": "Чтобы удалить запись, нажми на кнопку 🗑 ниже ⬇️",
-        "help_text": "ℹ️ *TasteBalance — твой AI-ассистент по питанию!*\n\n📸 Просто отправь фото еды или напиши блюдо — я определю состав и КБЖУ.\n\n💡 Для максимальной точности пиши вес в граммах. Формат \"2 яйца, 1 банан\" я тоже понимаю — это будет средний размер.\n\n🆓 *Бесплатно:* 2 фото в день\n💎 *Premium:* безлимит, улучшенная точность и автоотчёты\n\n📋 *Команды:*\n/start — главное меню\n/stats — статистика за день\n/history — история за неделю\n/premium — Premium-возможности\n/help — справка",
-        "manual_input_prompt": "📝 Введи блюдо текстом, например:\n\n_овсянка с молоком 100г и бананом 50г_\n_или же просто напиши:_\n_курица с рисом и овощами_\n\n✨ Для максимальной точности указывай вес в граммах.\nФормат вроде _\"3 яйца\", \"2 банана\"_ я тоже понимаю — я переведу их в средний вес.",
-        "feedback_choose": "💬 Выберите, что хотите отправить 👇",
-        "premium_info": "💎 *TasteBalance Premium*\n\n✅ Безлимит фото и анализов\n⚡ Улучшенная точность расчёта\n🍽️ Возможность редактировать блюда и ингредиенты\n📊 Автоотчёты за день и неделю\n🚀 Приоритетная скорость анализа\n\n💰 Всего $7.99 в месяц\n\nНажми ниже, чтобы оформить 👇",
-        "premium_features": "💎 *Что входит в Premium:*\n\n1. Безлимит фото и текстов\n2. Повышенная точность анализа\n3. Возможность редактировать ингредиенты\n4. Автоотчёты за день и неделю\n5. Быстрая очередь обработки ⚡",
-        "premium_active": "✅ Premium активен! Наслаждайтесь полным функционалом 💪",
-        "premium_inactive": "⚠️ Premium не активирован. Нажми /premium, чтобы оформить 💎",
-        "premium_already_active": "💎 У тебя уже активен Premium.",
-        "premium_until": "\n\nОн действует до: *{until}*",
-        "premium_no_need": "\n\nОплачивать ещё раз сейчас не нужно 🚫.",
-        "payment_processing": "🔒 Оплата проходит через Stripe.\n\nНажмите кнопку ниже — вас перенесёт на безопасную страницу оплаты.",
-        "payment_error": "⚠️ Не удалось создать платёжную сессию. Обратитесь к Автору через кнопку 'Отправить Отзыв или Сотрудничество'",
-        "analyzing_photo": "🧠 Анализирую блюдо…",
-        "analyzing_text": "🍽️ Анализирую блюдо...",
-        "analysis_failed": "⚠️ Не удалось определить блюдо. Попробуй уточнить или переформулировать.",
-        "meal_analysis": "🍽️ *Анализ блюда:*\n{lines}\n\n🔥 *Итого:* {kcal} ккал\nБ: {p} г  Ж: {f} г  У: {c} г",
-        "updated_meal": "🍽️ *Обновлённое блюдо:*\n{lines}\n🔥 *Итого:* {kcal} ккал\nБ: {p} г  Ж: {f} г  У: {c} г",
-        "meal_saved": "✅ Блюдо успешно добавлено в статистику за сегодня!\n\nМожешь продолжить — выбери действие из меню 👇",
-        "photo_limit": "📸 Сегодня лимит 2 фото.\n\n💎 *TasteBalance Premium* — без ограничений и с точным анализом.\nНажми «Получить Premium» ниже 👇",
-        "download_error": "⚠️ Не удалось загрузить фото. Проверь соединение и попробуй снова.",
-        "analysis_error": "⚠️ Ошибка анализа фото. Попробуй снова.",
-        "text_analysis_error": "⚠️ Ошибка анализа текста. Попробуй снова.",
-        "no_data_edit": "⚠️ Нет данных для редактирования. Сначала проанализируй фото.",
-        "edit_ingredient": "🔍 Выберите ингредиент для изменения:",
-        "edit_actions": "🔧 *Ингредиент:* {name} ({weight} г)\nЧто хотите изменить?",
-        "enter_new_name": "✏️ Введите новое название ингредиента:",
-        "enter_new_weight": "📏 Введите новый вес (в граммах):",
-        "weight_invalid": "⚠️ Вес должен быть положительным числом.",
-        "name_updated": "✅ Название обновлено, КБЖУ пересчитано!\n\n🔥 *Итого:* {kcal} ккал\nБ: {p} г  Ж: {f} г  У: {c} г",
-        "weight_updated": "✅ Вес обновлён и КБЖУ пересчитано!\n\n🔥 *Итого:* {kcal} ккал\nБ: {p} г  Ж: {f} г  У: {c} г",
-        "item_deleted": "🗑 Удалено: *{name}*",
-        "no_data_save": "⚠️ Нет данных для сохранения. Попробуйте снова.",
-        "feedback_sent": "✅ Спасибо! Сообщение отправлено разработчику 🙌\n\nТы можешь вернуться в главное меню — просто введи /start 💬",
-        "feedback_error": "⚠️ Не удалось отправить сообщение. Попробуй позже.",
-        "choose_action": "⚙️ Пожалуйста, выбери действие из меню 👇",
-        "premium_required": "💎 *Функции редактирования и управления доступны только в TasteBalance Premium!*\n\n🚀 Что ты получишь:\n• Изменение и удаление ингредиентов\n• Добавление блюд в статистику\n• Безлимит фото и текстов\n• Более точный анализ состава\n\n✨ Активируй Premium и управляй питанием как профи 👇",
-        "delete_success": "🗑 Запись удалена из статистики и истории.",
-        "delete_error": "⚠️ Не удалось удалить запись (возможно, она уже удалена).",
-        "admin_premium": "✅ Админ-Premium активирован на 30 дней.",
-        "language_prompt": "🌐 Выберите язык / Choose language:",
-        "rus_button": "🇷🇺 Русский",
-        "eng_button": "🇬🇧 English",
-        "add_ingredient_button": "➕ Добавить ингредиент",
-        "enter_new_ingredient": "📝 Введите новый ингредиент (например, 'банан 100г' или просто 'курица'):",
-        "setup_rmr": "📝 Шаг 1/6: Введите ваш RMR (базовый метаболизм, ккал/день) или 'calculate' для автоматического расчёта:",
-        "setup_protein": "📝 Шаг 2/6: Цель по белку (г/день). По умолчанию 220:",
-        "setup_carbs_min": "📝 Шаг 3/6: Минимум углеводов (г/день). По умолчанию 330:",
-        "setup_carbs_max": "📝 Шаг 4/6: Максимум углеводов (г/день). По умолчанию 360:",
-        "setup_fat": "📝 Шаг 5/6: Лимит жиров (г/день). По умолчанию 70:",
-        "setup_fibre": "📝 Шаг 6/6: Цель по клетчатке (г/день). По умолчанию 40:",
-        "setup_done": "✅ *Настройки сохранены!*\n\n📊 Ваши цели:\n🔥 RMR: {rmr} ккал\n🍗 Белок: {protein} г\n🍞 Углеводы: {carbs_min}-{carbs_max} г\n🥑 Жиры: до {fat} г\n🌾 Клетчатка: {fibre} г",
-        "setup_premium_only": "💎 Настройка целей питания доступна только в Premium.",
-        "setup_invalid_number": "⚠️ Введите корректное число.",
-        "stats_btn": "📊 Статистика",
-        "history_btn": "🕒 История",
-        "manual_input_btn": "✍️ Ввести вручную",
-        "premium_btn": "💎 Premium",
-        "language_btn": "🌐 Язык",
-        "feedback_btn": "💌 Отправить отзыв / сотрудничество"
-    },
-    "en": {
-        "main_menu_btn": "👋 Main Menu",
-        "nutrition_report_btn": "📊 Nutrition Report",
-        "greeting": "👋 Hi, {first_name}!\n\nI'm *TasteBalance*, your AI nutrition assistant 🍽️\n\n💎 *Status:* {'Premium active ✅' if is_premium else 'Free account (2 photos per day)'}\n\n📸 Just send a photo of food or write what you ate — I'll determine the composition and macros.\n\nOr choose an action from the menu: 👇",
-        "stats_today": "📈 *Today's result:*\n🔥 Calories: {kcal} kcal\n🍗 Protein: {p} g\n🥑 Fat: {f} g\n🍞 Carbs: {c} g",
-        "stats_empty": "🫙 Nothing added today yet.",
-        "history_empty": "📭 History is empty for the last 7 days.",
-        "history_title": "🕒 *History for 7 days:*\n\n",
-        "history_item": "{date_part}\n🍽️ {ingredients}\n🔥 {kcal} kcal — P: {p} F: {f} C: {c}\n\n",
-        "delete_prompt": "To delete a record, click the 🗑 button below ⬇️",
-        "help_text": "ℹ️ *TasteBalance — your AI nutrition assistant!*\n\n📸 Just send a photo of food or write a dish — I'll determine the composition and macros.\n\n💡 For maximum accuracy, write weight in grams. Format like \"2 eggs, 1 banana\" I also understand — it will be average size.\n\n🆓 *Free:* 2 photos per day\n💎 *Premium:* unlimited, improved accuracy and auto-reports\n\n📋 *Commands:*\n/start — main menu\n/stats — daily stats\n/history — history for a week\n/premium — Premium features\n/help — help",
-        "manual_input_prompt": "📝 Enter the dish in text, for example:\n\n_oatmeal with milk 100g and banana 50g_\n_or just write:_\n_chicken with rice and vegetables_\n\n✨ For maximum accuracy, specify weight in grams.\nFormat like _\"3 eggs\", \"2 bananas\"_ I also understand — I'll convert them to average weight.",
-        "feedback_choose": "💬 Choose what you want to send 👇",
-        "premium_info": "💎 *TasteBalance Premium*\n\n✅ Unlimited photos and analyses\n⚡ Improved calculation accuracy\n🍽️ Ability to edit dishes and ingredients\n📊 Auto-reports for day and week\n🚀 Priority processing speed\n\n💰 Only $7.99 per month\n\nClick below to subscribe 👇",
-        "premium_features": "💎 *What's included in Premium:*\n\n1. Unlimited photos and texts\n2. Increased analysis accuracy\n3. Ability to edit ingredients\n4. Auto-reports for day and week\n5. Fast processing queue ⚡",
-        "premium_active": "✅ Premium is active! Enjoy full functionality 💪",
-        "premium_inactive": "⚠️ Premium is not activated. Click /premium to subscribe 💎",
-        "premium_already_active": "💎 You already have active Premium.",
-        "premium_until": "\n\nIt is active until: *{until}*",
-        "premium_no_need": "\n\nNo need to pay again right now 🚫.",
-        "payment_processing": "🔒 Payment is processed through Stripe.\n\nClick the button below — you'll be taken to the secure payment page.",
-        "payment_error": "⚠️ Failed to create payment session. Contact the Author via 'Send Feedback or Cooperation' button",
-        "analyzing_photo": "🧠 Analyzing the dish…",
-        "analyzing_text": "🍽️ Analyzing the dish...",
-        "analysis_failed": "⚠️ Could not determine the dish. Try to clarify or rephrase.",
-        "meal_analysis": "🍽️ *Dish analysis:*\n{lines}\n\n🔥 *Total:* {kcal} kcal\nP: {p} g  F: {f} g  C: {c} g",
-        "updated_meal": "🍽️ *Updated dish:*\n{lines}\n🔥 *Total:* {kcal} kcal\nP: {p} g  F: {f} g  C: {c} g",
-        "meal_saved": "✅ Dish successfully added to today's stats!\n\nYou can continue — choose an action from the menu 👇",
-        "photo_limit": "📸 Today's limit is 2 photos.\n\n💎 *TasteBalance Premium* — no limits and accurate analysis.\nClick 'Get Premium' below 👇",
-        "download_error": "⚠️ Failed to download photo. Check connection and try again.",
-        "analysis_error": "⚠️ Photo analysis error. Try again.",
-        "text_analysis_error": "⚠️ Text analysis error. Try again.",
-        "no_data_edit": "⚠️ No data to edit. Analyze a photo first.",
-        "edit_ingredient": "🔍 Select an ingredient to change:",
-        "edit_actions": "🔧 *Ingredient:* {name} ({weight} g)\nWhat do you want to change?",
-        "enter_new_name": "✏️ Enter new ingredient name:",
-        "enter_new_weight": "📏 Enter new weight (in grams):",
-        "weight_invalid": "⚠️ Weight must be a positive number.",
-        "name_updated": "✅ Name updated, macros recalculated!\n\n🔥 *Total:* {kcal} kcal\nP: {p} g  F: {f} g  C: {c} g",
-        "weight_updated": "✅ Weight updated and macros recalculated!\n\n🔥 *Total:* {kcal} kcal\nP: {p} g  F: {f} g  C: {c} g",
-        "item_deleted": "🗑 Deleted: *{name}*",
-        "no_data_save": "⚠️ No data to save. Try again.",
-        "feedback_sent": "✅ Thanks! Message sent to the developer 🙌\n\nYou can return to the main menu — just type /start 💬",
-        "feedback_error": "⚠️ Failed to send message. Try later.",
-        "choose_action": "⚙️ Please choose an action from the menu 👇",
-        "premium_required": "💎 *Editing and management features are available only in TasteBalance Premium!*\n\n🚀 What you'll get:\n• Edit and delete ingredients\n• Add dishes to stats\n• Unlimited photos and texts\n• More accurate composition analysis\n\n✨ Activate Premium and manage nutrition like a pro 👇",
-        "delete_success": "🗑 Record deleted from stats and history.",
-        "delete_error": "⚠️ Failed to delete record (maybe it's already deleted).",
-        "admin_premium": "✅ Admin-Premium activated for 30 days.",
-        "language_prompt": "🌐 Выберите язык / Choose language:",
-        "rus_button": "🇷🇺 Русский",
-        "eng_button": "🇬🇧 English",
-        "add_ingredient_button": "➕ Add Ingredient",
-        "enter_new_ingredient": "📝 Enter new ingredient (e.g., 'banana 100g' or just 'chicken'):",
-        "setup_rmr": "📝 Step 1/6: Enter your RMR (basal metabolism, kcal/day) or 'calculate' for automatic calculation:",
-        "setup_protein": "📝 Step 2/6: Protein goal (g/day). Default 220:",
-        "setup_carbs_min": "📝 Step 3/6: Minimum carbs (g/day). Default 330:",
-        "setup_carbs_max": "📝 Step 4/6: Maximum carbs (g/day). Default 360:",
-        "setup_fat": "📝 Step 5/6: Fat limit (g/day). Default 70:",
-        "setup_fibre": "📝 Step 6/6: Fibre goal (g/day). Default 40:",
-        "setup_done": "✅ *Settings saved!*\n\n📊 Your goals:\n🔥 RMR: {rmr} kcal\n🍗 Protein: {protein} g\n🍞 Carbs: {carbs_min}-{carbs_max} g\n🥑 Fat: up to {fat} g\n🌾 Fibre: {fibre} g",
-        "setup_premium_only": "💎 Nutrition goals setup is available only in Premium.",
-        "setup_invalid_number": "⚠️ Enter a valid number.",
-        "stats_btn": "📊 Statistics",
-        "history_btn": "🕒 History",
-        "manual_input_btn": "✍️ Manual Input",
-        "premium_btn": "💎 Premium",
-        "language_btn": "🌐 Language",
-        "feedback_btn": "💌 Send Feedback / Cooperation"
-    }
-}
-
-# ======================================
 # 📋 Главное меню и команды
 # ======================================
 
-def main_menu(lang):
+def main_menu():
     keyboard = [
-        [types.KeyboardButton(text=LANG[lang]["stats_btn"]), types.KeyboardButton(text=LANG[lang]["history_btn"])],
-        [types.KeyboardButton(text=LANG[lang]["manual_input_btn"]), types.KeyboardButton(text=LANG[lang]["premium_btn"])],
-        [types.KeyboardButton(text=LANG[lang]["nutrition_report_btn"]), types.KeyboardButton(text=LANG[lang]["language_btn"])],
-        [types.KeyboardButton(text=LANG[lang]["feedback_btn"]), types.KeyboardButton(text=LANG[lang]["main_menu_btn"])]
+        [types.KeyboardButton(text="📊 Статистика"), types.KeyboardButton(text="🕒 История")],
+        [types.KeyboardButton(text="🍽️ Питание")],
+        [types.KeyboardButton(text="⚙️ Профиль и цели")],
+        [types.KeyboardButton(text="ℹ️ Помощь"), types.KeyboardButton(text="💎 Premium")],
+        [types.KeyboardButton(text="💌 Отзыв / Сотрудничество")]
     ]
     return types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+def menu_with_back(buttons: list):
+    """Создаёт клавиатуру с кнопками + кнопка '⬅️ Назад'."""
+    # Преобразуем одиночные кнопки в списки, если нужно
+    if buttons and not isinstance(buttons[0], list):
+        buttons = [[btn] for btn in buttons]
+    # Добавляем кнопку "Назад" в конец
+    buttons.append([types.KeyboardButton(text="⬅️ Назад")])
+    return types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 # ======================================
 # 👋 /start
@@ -435,37 +342,18 @@ def main_menu(lang):
 @dp.message(Command("start"))
 @dp.message(F.text == "👋 Главное меню")
 async def start_cmd(message: types.Message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    lang = get_user_lang(user_id)
+    user = get_user(message.from_user.id)
+    is_premium = is_premium_active(message.from_user.id)
 
-    if not lang or lang not in LANG:
-        # Language not set, show language selection
-        builder = InlineKeyboardBuilder()
-        builder.button(text=LANG["ru"]["rus_button"], callback_data="set_lang_ru")
-        builder.button(text=LANG["en"]["eng_button"], callback_data="set_lang_en")
-        builder.adjust(1)
-        await message.answer(LANG["ru"]["language_prompt"], reply_markup=builder.as_markup())
-        return
+    greeting = (
+        f"👋 Привет, {message.from_user.first_name or 'друг'}!\n\n"
+        f"Я — *TasteBalance*, твой AI-ассистент по питанию 🍽️\n\n"
+        f"💎 *Статус:* {'Premium активен ✅' if is_premium else 'Бесплатный аккаунт (2 фото в день)'}\n\n"
+        "📸 Просто отправь фото еды или напиши, что ты ел — я определю состав и КБЖУ.\n\n"
+        "Или выбери действие из меню: 👇 "
+    )
 
-    is_premium = is_premium_active(user_id)
-    status = "Premium активен ✅" if is_premium else "Бесплатный аккаунт (2 фото в день)" if lang == "ru" else "Premium active ✅" if is_premium else "Free account (2 photos per day)"
-    greeting = LANG[lang]["greeting"].format(first_name=message.from_user.first_name or ('друг' if lang == "ru" else 'friend'), status=status)
-
-    await message.answer(greeting, parse_mode="Markdown", reply_markup=main_menu(lang))
-
-
-@dp.callback_query(F.data == "set_lang_ru")
-async def set_lang_ru(callback: types.CallbackQuery):
-    update_user(callback.from_user.id, language="ru")
-    await start_cmd(callback.message)
-    await callback.answer()
-
-@dp.callback_query(F.data == "set_lang_en")
-async def set_lang_en(callback: types.CallbackQuery):
-    update_user(callback.from_user.id, language="en")
-    await start_cmd(callback.message)
-    await callback.answer()
+    await message.answer(greeting, parse_mode="Markdown", reply_markup=main_menu())
 
 
 # ======================================
@@ -476,14 +364,244 @@ async def set_lang_en(callback: types.CallbackQuery):
 @dp.message(F.text == "📊 Статистика")
 async def stats_cmd(message: types.Message):
     user_id = message.from_user.id
-    lang = get_user_lang(user_id)
     kcal, p, f, c = get_stats(user_id)
-    if kcal and kcal > 0:
-        text = LANG[lang]["stats_today"].format(kcal=round(kcal), p=round(p), f=round(f), c=round(c))
+
+    # Проверяем, есть ли RMR и цель
+    cursor.execute("""
+        SELECT gender, age, weight_kg, height_cm, goal, activity_level,
+            custom_calories, custom_protein, custom_fat, custom_carbs
+        FROM users WHERE user_id=?
+    """, (user_id,))
+    row = cursor.fetchone()
+    has_rmr_data = row and all(row[:4])
+    if has_rmr_data:
+        # Используем кастомные цели, если заданы
+        if row[6] is not None:  # custom_calories
+            limit = row[6]
+            p_goal = row[7] or 0
+            f_goal = row[8] or 0
+            c_goal = row[9] or 0
+        else:
+            rmr = calculate_rmr(*row[:4])
+            activity = row[5] or 1.375
+            macros = calculate_macros(rmr, activity, row[4] or "maintenance")
+            limit = macros["calories"]
+            p_goal = macros["protein"]
+            f_goal = macros["fat"]
+            c_goal = macros["carbs"]
+
+        eaten_kcal, eaten_p, eaten_f, eaten_c = get_stats(user_id)
+        eaten_kcal = eaten_kcal or 0
+
+        remaining = max(0, limit - eaten_kcal)
+        percent = min(100, round(eaten_kcal / limit * 100)) if limit > 0 else 0
+
+        goal_labels = {
+            "deficit": "📉 Похудение",
+            "maintenance": "⚖️ Поддержание",
+            "surplus": "📈 Набор массы"
+        }
+        goal_text = goal_labels.get(row[4], "Не выбрана") if row[4] else "Не выбрана"
+
+        bar = "▰" * (percent // 10) + "▱" * (10 - percent // 10)
+        text = (
+            f"📊 *Цель:* {goal_text}\n"
+            f"🎯 *Лимит:* {limit} ккал/день\n"
+            f"{bar} ({percent}%)\n"
+            f"✅ *Съедено:* {round(eaten_kcal)} ккал\n"
+            f"➕ *Можно ещё:* {round(remaining)} ккал\n\n"
+            f"🍗 Белки: {round(eaten_p)} / {round(p_goal)} г\n"
+            f"🥑 Жиры: {round(eaten_f)} / {round(f_goal)} г\n"
+            f"🍞 Углеводы: {round(eaten_c)} / {round(c_goal)} г"
+        )
     else:
-        text = LANG[lang]["stats_empty"]
+        # Стандартный режим без RMR
+        if kcal and kcal > 0:
+            text = (
+                f"📈 *Сегодняшний результат:*\n"
+                f"🔥 Калории: {round(kcal)} ккал\n"
+                f"🍗 Белки: {round(p)} г\n"
+                f"🥑 Жиры: {round(f)} г\n"
+                f"🍞 Углеводы: {round(c)} г"
+            )
+        else:
+            text = "🫙 Сегодня ещё ничего не добавлено."
+
     await message.answer(text, parse_mode="Markdown", reply_markup=main_menu())
 
+#==============
+# === menu 2 ===
+#===============
+
+@dp.message(F.text == "🍽️ Питание")
+async def menu_nutrition(message: types.Message):
+    kb = [
+        types.KeyboardButton(text="✍️ Ввести вручную"),
+        types.KeyboardButton(text="📸 Отправить фото")
+    ]
+    await message.answer(
+        "Выберите способ добавления еды:",
+        reply_markup=menu_with_back(kb)
+    )
+
+@dp.message(F.text == "⚙️ Профиль и цели")
+async def menu_profile(message: types.Message):
+    kb = [
+        types.KeyboardButton(text="🧮 RMR и Цели"),
+        types.KeyboardButton(text="🎯 Задать свои цели")
+    ]
+    await message.answer(
+        "Управление профилем и целями:",
+        reply_markup=menu_with_back(kb)
+    )
+
+# ======================================
+# RMR
+# ======================================
+
+@dp.message(F.text == "🧮 RMR и Цели")
+async def start_rmr(message: types.Message):
+    user_id = message.from_user.id
+    if not is_premium_active(user_id):
+        builder = InlineKeyboardBuilder()
+        builder.button(text="💎 Получить Premium", callback_data="buy_premium")
+        await message.answer(
+            "🧮 *Расчёт RMR доступен только в TasteBalance Premium!* 💎\n"
+            "✅ Узнай свой базовый метаболизм\n"
+            "✅ Получи персонализированные рекомендации по калориям\n"
+            "✅ Интеграция с дневником питания\n"
+            "Нажми ниже, чтобы активировать Premium 👇",
+            parse_mode="Markdown",
+            reply_markup=builder.as_markup()
+        )
+        return
+
+    cursor.execute("SELECT gender, age, weight_kg, height_cm FROM users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        await message.answer("⚠️ Ошибка профиля. Напишите /start.")
+        return
+
+    gender, age, weight, height = row
+    missing = []
+    if not gender: missing.append("пол")
+    if not age: missing.append("возраст")
+    if not weight: missing.append("вес")
+    if not height: missing.append("рост")
+
+    if missing:
+        dp.workflow_data[str(user_id)] = {"mode": "rmr", "step": 0, "data": {}}
+        await ask_rmr_question(message, user_id, 0)
+    else:
+        rmr = calculate_rmr(gender, age, weight, height)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="📉 Похудеть", callback_data="set_goal:deficit")
+        builder.button(text="⚖️ Поддерживать", callback_data="set_goal:maintenance")
+        builder.button(text="📈 Набрать", callback_data="set_goal:surplus")
+        builder.button(text="🔄 Пересчитать RMR", callback_data="recalculate_rmr")  # ← НОВАЯ КНОПКА
+        builder.adjust(2)
+        await message.answer(
+            f"🧮 *Ваш RMR:* {round(rmr)} ккал/день\n"
+            f"💡 Выберите свою цель питания:",
+            parse_mode="Markdown",
+            reply_markup=builder.as_markup()
+        )
+
+@dp.callback_query(F.data == "recalculate_rmr")
+async def recalculate_rmr(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    # Сбрасываем профиль → заставляем пройти заново
+    cursor.execute("""
+        UPDATE users SET gender=NULL, age=NULL, weight_kg=NULL, height_cm=NULL, goal=NULL
+        WHERE user_id=?
+    """, (user_id,))
+    conn.commit()
+    dp.workflow_data[str(user_id)] = {"mode": "rmr", "step": 0, "data": {}}
+    await ask_rmr_question(callback.message, user_id, 0)
+    await callback.answer("🔄 Начинаем пересчёт профиля...")
+
+@dp.callback_query(F.data.startswith("set_goal:"))
+async def set_nutrition_goal(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    goal = callback.data.split(":", 1)[1]
+    update_user(user_id, goal=goal)
+
+    # Получаем все данные пользователя
+    cursor.execute("SELECT gender, age, weight_kg, height_cm, activity_level FROM users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    if not row or not all(row[:4]):
+        await callback.message.answer("⚠️ Не хватает данных профиля. Запустите /start и выберите «🧮 RMR и Цели».")
+        await callback.answer()
+        return
+
+    rmr = calculate_rmr(*row[:4])
+    activity_level = row[4] if row[4] is not None else 1.375
+    limit = get_daily_calorie_limit(rmr, activity_level, goal)
+
+    goal_labels = {
+        "deficit": "📉 Похудение",
+        "maintenance": "⚖️ Поддержание веса",
+        "surplus": "📈 Набор массы"
+    }
+    goal_text = goal_labels.get(goal, "Не выбрана")
+
+    await callback.message.answer(
+        f"✅ Цель установлена: *{goal_text}*\n"
+        f"🎯 Ваш дневной лимит: ~{limit} ккал\n"
+        f"🧮 RMR: {round(rmr)} ккал | Активность: x{activity_level}",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.message(F.text == "⚡ Уровень активности")
+async def set_activity_cmd(message: types.Message):
+    if not is_premium_active(message.from_user.id):
+        await message.answer("💎 Выбор активности доступен только в Premium.")
+        return
+
+    explanation = (
+        "Выберите ваш уровень физической активности:\n\n"
+        "• 🪑 *Сидячий* — почти нет тренировок, работа за компьютером\n"
+        "• 🚶 *Лёгкая активность* — 1–3 тренировки в неделю или много ходьбы\n"
+        "• 🏃 *Умеренная активность* — 3–5 тренировок в неделю\n"
+        "• 🏋️ *Высокая активность* — 6–7 тренировок или тяжёлая физическая работа"
+    )
+
+    kb = []
+    for key, (label, _) in ACTIVITY_LEVELS.items():
+        kb.append([InlineKeyboardButton(text=label, callback_data=f"set_activity_{key}")])
+    
+    keyboard = InlineKeyboardBuilder(markup=kb)
+    await message.answer(explanation, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+
+@dp.callback_query(F.data.startswith("set_activity_"))
+async def set_activity_handler(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    level_key = callback.data.split("_")[-1]
+    if level_key not in ACTIVITY_LEVELS:
+        await callback.answer("Неверный выбор.")
+        return
+    _, multiplier = ACTIVITY_LEVELS[level_key]
+    update_user(user_id, activity_level=multiplier)
+    await callback.message.edit_text(f"✅ Активность установлена: {ACTIVITY_LEVELS[level_key][0]}")
+    await callback.answer()
+
+@dp.message(F.text == "🎯 Задать свои цели")
+async def set_custom_goals(message: types.Message):
+    if not is_premium_active(message.from_user.id):
+        await message.answer("💎 Ручная настройка целей доступна только в Premium.")
+        return
+    cancel_kb = [[types.KeyboardButton(text="❌ Отмена")]]
+    markup = types.ReplyKeyboardMarkup(keyboard=cancel_kb, resize_keyboard=True, one_time_keyboard=False)
+    await message.answer(
+        "🎯 Введите ваши цели в формате:\n"
+        "`ккал белки жиры углеводы`\n\n"
+        "Пример: `2500 150 80 300`\n\n"
+        "Или нажмите «❌ Отмена».",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    dp.workflow_data[str(message.from_user.id)] = {"mode": "set_custom_goals"}
 
 # ======================================
 # 🕒 /history — история за неделю
@@ -493,26 +611,30 @@ async def stats_cmd(message: types.Message):
 @dp.message(F.text == "🕒 История")
 async def history_cmd(message: types.Message):
     """Показать историю за последние 7 дней и дать возможность удалить записи."""
-    user_id = message.from_user.id
-    lang = get_user_lang(user_id)
     cursor.execute(
         "SELECT id, date, time, description, calories, protein, fat, carbs "
         "FROM meals WHERE user_id=? AND date>=? "
         "ORDER BY date DESC, time DESC",
-        (user_id, (date.today() - timedelta(days=7)).isoformat())
+        (message.from_user.id, (date.today() - timedelta(days=7)).isoformat())
     )
     rows = cursor.fetchall()
 
     if not rows:
-        await message.answer(LANG[lang]["history_empty"], reply_markup=main_menu(lang))
+        await message.answer("📭 История пуста за последние 7 дней.", reply_markup=main_menu())
         return
 
-    text = LANG[lang]["history_title"]
+    text = "🕒 *История за 7 дней:*\n\n"
     for meal_id, d, t, desc, kcal, p, f, c in rows:
         date_part = f"📅 {d}"
-        ingredients = desc.replace("Фото еды", "📷 Фото блюда" if lang == "ru" else "📷 Photo of dish")
+        # time_part = f"🕐 {t}" if t else ""
+        ingredients = desc.replace("Фото еды", "📷 Фото блюда")
 
-        text += LANG[lang]["history_item"].format(date_part=date_part, ingredients=ingredients, kcal=round(kcal), p=round(p), f=round(f), c=round(c))
+        text += (
+            f"{date_part}\n"
+            f"🍽️ {ingredients}\n"
+            f"🔥 {round(kcal)} ккал — "
+            f"Б: {round(p)} Ж: {round(f)} У: {round(c)}\n\n"
+        )
 
     # Инлайн-кнопки для удаления (ограничим, скажем, 15 последними записями, чтобы не раздувать клавиатуру)
     builder = InlineKeyboardBuilder()
@@ -526,7 +648,7 @@ async def history_cmd(message: types.Message):
     if rows:
         builder.adjust(1)
 
-    text += LANG[lang]["delete_prompt"]
+    text += "Чтобы удалить запись, нажми на кнопку 🗑 ниже ⬇️"
 
     await message.answer(
         text.strip(),
@@ -541,75 +663,20 @@ async def history_cmd(message: types.Message):
 @dp.message(Command("help"))
 @dp.message(F.text == "ℹ️ Помощь")
 async def help_cmd(message: types.Message):
-    lang = get_user_lang(message.from_user.id)
-    await message.answer(LANG[lang]["help_text"], parse_mode="Markdown", reply_markup=main_menu(lang))
-
-
-@dp.message(Command("setup"))
-async def setup_cmd(message: types.Message):
-    if not is_premium_active(message.from_user.id):
-        lang = get_user_lang(message.from_user.id)
-        await message.answer(LANG[lang]["setup_premium_only"])
-        return
-    user_id = str(message.from_user.id)
-    dp.workflow_data[user_id] = {"mode": "setup", "step": 1, "data": {}}
-    lang = get_user_lang(message.from_user.id)
-    await message.answer(LANG[lang]["setup_rmr"], parse_mode="Markdown")
-
-
-@dp.message(F.text.in_({"📊 Отчёт по целям", "📊 Nutrition Report"}))
-async def nutrition_report(message: types.Message):
-    if not is_premium_active(message.from_user.id):
-        lang = get_user_lang(message.from_user.id)
-        await message.answer(LANG[lang]["setup_premium_only"])
-        return
-
-    user = get_user(message.from_user.id)
-    # Проверяем, что RMR задан (минимум одно поле)
-    if len(user) < 14 or not user[6]:  # rmr = users[6]
-        lang = get_user_lang(message.from_user.id)
-        await message.answer("⚠️ Сначала настрой цели через /setup")
-        return
-
-    # Извлекаем все цели
-    rmr = user[6] or 0
-    protein_goal = user[7]
-    carbs_min = user[8]
-    carbs_max = user[9]
-    fat_limit = user[10]
-    fibre_goal = user[11]
-    activity_calories = user[12] or 0
-
-    kcal, p, f, c = get_stats(message.from_user.id)
-    deficit = (rmr + activity_calories) - kcal
-
-    violations = []
-    if protein_goal and p < protein_goal:
-        violations.append(f"Белки: {round(p)} < {protein_goal}")
-    if fat_limit and f > fat_limit:
-        violations.append(f"Жиры: {round(f)} > {fat_limit}")
-    if carbs_min and c < carbs_min:
-        violations.append(f"Углеводы: {round(c)} < {carbs_min}")
-    if carbs_max and c > carbs_max:
-        violations.append(f"Углеводы: {round(c)} > {carbs_max}")
-    if fibre_goal and c < fibre_goal:  # временно считаем клетчатку частью углеводов
-        violations.append(f"Клетчатка: {round(c)} < {fibre_goal}")
-
-    lang = get_user_lang(message.from_user.id)
     text = (
-        f"📊 *{LANG[lang]['nutrition_report_btn'].replace('📊 ', '')}:*\n"
-        f"🔥 Калории: {round(kcal)} / {round(rmr + activity_calories)}\n"
-        f"🍗 Белки: {round(p)}" + (f" / {protein_goal}" if protein_goal else "") + "\n"
-        f"🥑 Жиры: {round(f)}" + (f" / до {fat_limit}" if fat_limit else "") + "\n"
-        f"🍞 Углеводы: {round(c)}" + (f" / {carbs_min}–{carbs_max}" if carbs_min or carbs_max else "") + "\n"
-        f"⚖️ Дефицит: {round(deficit)} ккал\n"
+        "ℹ️ *TasteBalance — твой AI-ассистент по питанию!*\n\n"
+        "📸 Просто отправь фото еды или напиши блюдо — я определю состав и КБЖУ.\n\n"
+        "💡 Для максимальной точности пиши вес в граммах. Формат \"2 яйца, 1 банан\" я тоже понимаю — это будет средний размер.\n\n"
+        "🆓 *Бесплатно:* 2 фото в день\n"
+        "💎 *Premium:* безлимит, улучшенная точность и автоотчёты\n\n"
+        "📋 *Команды:*\n"
+        "/start — главное меню\n"
+        "/stats — статистика за день\n"
+        "/history — история за неделю\n"
+        "/premium — Premium-возможности\n"
+        "/help — справка"
     )
-    if violations:
-        text += "⚠️ Нарушения:\n" + "\n".join(violations)
-    else:
-        text += "✅ Все цели соблюдены!"
-
-    await message.answer(text, parse_mode="Markdown", reply_markup=main_menu(lang))
+    await message.answer(text, parse_mode="Markdown", reply_markup=main_menu())
 
 # ======================================
 # ✍️ Ввести вручную
@@ -620,9 +687,16 @@ async def manual_input(message: types.Message):
     """Начинает ручной ввод блюда."""
     user_id = str(message.from_user.id)
     dp.workflow_data[user_id] = {"mode": "manual_input"}
-    lang = get_user_lang(message.from_user.id)
 
-    await message.answer(LANG[lang]["manual_input_prompt"], parse_mode="Markdown")
+    await message.answer(
+    "📝 Введи блюдо текстом, например:\n\n"
+    "_овсянка с молоком 100г и бананом 50г_\n"
+    "_или же просто напиши:_\n"
+    "_курица с рисом и овощами_\n\n"
+    "✨ Для максимальной точности указывай вес в граммах.\n"
+    "Формат вроде _\"3 яйца\", \"2 банана\"_ я тоже понимаю — я переведу их в средний вес.",
+    parse_mode="Markdown"
+)
     
 # ======================================
 # 💬 Отзывы и сотрудничество
@@ -633,13 +707,12 @@ FEEDBACK_TARGET_ID = 408204060  # <-- замени на свой Telegram ID
 @dp.message(Command("feedback"))
 @dp.message(F.text == "💌 Отправить отзыв / сотрудничество")
 async def feedback_entry(message: types.Message):
-    lang = get_user_lang(message.from_user.id)
     builder = InlineKeyboardBuilder()
-    builder.button(text="💭 Оставить отзыв" if lang == "ru" else "💭 Leave feedback", callback_data="feedback")
-    builder.button(text="🤝 Предложить сотрудничество" if lang == "ru" else "🤝 Suggest cooperation", callback_data="cooperation")
+    builder.button(text="💭 Оставить отзыв", callback_data="feedback")
+    builder.button(text="🤝 Предложить сотрудничество", callback_data="cooperation")
     builder.adjust(1)
 
-    await message.answer(LANG[lang]["feedback_choose"], reply_markup=builder.as_markup())
+    await message.answer("💬 Выберите, что хотите отправить 👇", reply_markup=builder.as_markup())
 
 
 @dp.callback_query(F.data.in_(["feedback", "cooperation"]))
@@ -678,8 +751,15 @@ async def premium_info(message: types.Message):
 
 @dp.callback_query(F.data == "premium_features")
 async def premium_features(callback: types.CallbackQuery):
-    lang = get_user_lang(callback.from_user.id)
-    await callback.message.answer(LANG[lang]["premium_features"], parse_mode="Markdown")
+    text = (
+        "💎 *Что входит в Premium:*\n\n"
+        "1. Безлимит фото и текстов\n"
+        "2. Повышенная точность анализа\n"
+        "3. Возможность редактировать ингредиенты\n"
+        "4. Автоотчёты за день и неделю\n"
+        "5. Быстрая очередь обработки ⚡"
+    )
+    await callback.message.answer(text, parse_mode="Markdown")
     await callback.answer()
 
 
@@ -1035,9 +1115,151 @@ async def root_page(request: web.Request):
 # 💬 Универсальный обработчик текста (ввод блюда, редактирование, отзывы)
 # ======================================
 
+RMR_QUESTIONS = [
+    ("Какой у вас пол?", ["Мужской", "Женский"]),
+    ("Сколько вам лет?", None),
+    ("Ваш вес (в кг)?", None),
+    ("Ваш рост (в см)?", None),
+    ("Какой у вас уровень физической активности?\n\n"
+    "• 🪑 Сидячий — почти нет тренировок, работа за компьютером\n"
+    "• 🚶 Лёгкая активность — 1–3 тренировки в неделю или много ходьбы\n"
+    "• 🏃 Умеренная активность — 3–5 тренировок в неделю\n"
+    "• 🏋️ Высокая активность — 6–7 тренировок или тяжёлая физическая работа", list(ACTIVITY_LEVELS.keys()))
+]
+
+async def ask_rmr_question(message: types.Message, user_id: int, step: int):
+    question, options = RMR_QUESTIONS[step]
+    if options:
+        if step == 4:  # активность — показываем человекочитаемые названия
+            labels = [ACTIVITY_LEVELS[key][0] for key in options]
+            kb = [[types.KeyboardButton(text=label) for label in labels]]
+        else:
+            kb = [[types.KeyboardButton(text=o) for o in options]]
+        markup = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, one_time_keyboard=True)
+        await message.answer(question, reply_markup=markup)
+    else:
+        await message.answer(question)
+
+# Обновлённый обработчик текста — вставляем в начало handle_any_text
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_any_text(message: types.Message):
     user_key = str(message.from_user.id)
+
+    # ===== RMR диалог =====
+    wf = dp.workflow_data.get(user_key)
+    if wf and wf.get("mode") == "rmr":
+        step = wf.get("step", 0)
+        data = wf.get("data", {})
+        text = message.text.strip()
+
+        try:
+            if step == 0:  # Пол
+                if text == "Мужской":
+                    data["gender"] = "male"
+                elif text == "Женский":
+                    data["gender"] = "female"
+                else:
+                    await message.answer("Пожалуйста, выберите из предложенных вариантов.")
+                    return
+            elif step == 1:  # Возраст
+                age = int(text)
+                if not (10 <= age <= 120):
+                    raise ValueError
+                data["age"] = age
+            elif step == 2:  # Вес
+                weight = float(text.replace(",", "."))
+                if not (30 <= weight <= 300):
+                    raise ValueError
+                data["weight_kg"] = weight
+            elif step == 3:  # Рост
+                height = float(text.replace(",", "."))
+                if not (100 <= height <= 250):
+                    raise ValueError
+                data["height_cm"] = height
+            elif step == 4:  # Активность
+                label_to_key = {ACTIVITY_LEVELS[k][0]: k for k in ACTIVITY_LEVELS}
+                if text in label_to_key:
+                    activity_key = label_to_key[text]
+                data["activity_level"] = ACTIVITY_LEVELS[activity_key][1]
+            else:
+                await message.answer("Пожалуйста, выберите из предложенных вариантов.")
+                return
+
+            # Сохраняем и переходим дальше
+            wf["data"] = data
+            if step < 4:
+                wf["step"] = step + 1
+                await ask_rmr_question(message, message.from_user.id, step + 1)
+            else:
+                # Все данные собраны → сохраняем в БД
+                update_user(
+                    message.from_user.id,
+                    gender=data["gender"],
+                    age=data["age"],
+                    weight_kg=data["weight_kg"],
+                    height_cm=data["height_cm"],
+                    activity_level=data["activity_level"]
+                )
+
+                rmr = calculate_rmr(data["gender"], data["age"], data["weight_kg"], data["height_cm"])
+                tdee = rmr * data["activity_level"]
+
+                # Теперь можем дать точные цифры!
+                deficit = round(tdee * 0.85)
+                surplus = round(tdee * 1.10)
+                maint = round(tdee)
+
+                await message.answer(
+                    f"✅ Профиль полностью настроен!\n"
+                    f"🧮 RMR: {round(rmr)} ккал\n"
+                    f"⚡ Активность: {text}\n"
+                    f"🎯 TDEE (поддержание): {maint} ккал/день\n\n"
+                    f"💡 Ваши точные цели:\n"
+                    f"• 📉 Похудение: {deficit} ккал\n"
+                    f"• ⚖️ Поддержание: {maint} ккал\n"
+                    f"• 📈 Набор массы: {surplus} ккал",
+                    parse_mode="Markdown",
+                    reply_markup=main_menu()
+                )
+                dp.workflow_data.pop(user_key, None)
+            return
+        except (ValueError, TypeError):
+            if step == 1:
+                await message.answer("Введите корректный возраст (от 10 до 120).")
+            elif step == 2:
+                await message.answer("Введите вес в килограммах (например: 70.5).")
+            elif step == 3:
+                await message.answer("Введите рост в сантиметрах (например: 175).")
+            return
+
+    # --- Rachet ---
+    wf = dp.workflow_data.get(user_key)
+    if wf and wf.get("mode") == "set_custom_goals":
+        if message.text.strip() == "❌ Отмена":
+            dp.workflow_data.pop(user_key, None)
+            await message.answer("❌ Настройка целей отменена.", reply_markup=main_menu())
+            return
+        try:
+            parts = message.text.strip().split()
+            if len(parts) != 4:
+                raise ValueError
+            kcal, p, f, c = map(float, parts)
+            update_user(
+                message.from_user.id,
+                custom_calories=int(kcal),
+                custom_protein=p,
+                custom_fat=f,
+                custom_carbs=c
+            )
+            await message.answer(
+                f"✅ Ваши цели установлены:\n"
+                f"🔥 {int(kcal)} ккал | 🍗 {p} г | 🥑 {f} г | 🍞 {c} г",
+                reply_markup=main_menu()
+            )
+            dp.workflow_data.pop(user_key, None)
+        except Exception:
+            await message.answer("⚠️ Неверный формат. Пример: `2500 150 80 300`")
+        return
 
     # ----- Admin secret premium -----
     secret = os.getenv("ADMIN_PREMIUM_CODE", "")
@@ -1207,204 +1429,8 @@ async def handle_any_text(message: types.Message):
         except ValueError:
             await message.answer("⚠️ Введите корректное число (в граммах).")
         return
-
-    # --- добавление нового ингредиента ---
-    if wf and wf.get("stage") == "await_new_ingredient":
-        user_text = message.text.strip()
-        await message.answer("🍽️ Анализирую новый ингредиент...")
-
-        # Парсим вес из текста
-        weight = 100  # По умолчанию
-        name = user_text
-        weight_match = re.search(r'(\d+)\s*г', user_text, re.IGNORECASE)
-        if weight_match:
-            weight = int(weight_match.group(1))
-            name = re.sub(r'\d+\s*г', '', user_text, flags=re.IGNORECASE).strip()
-
-        try:
-            # ✨ Анализируем только этот ингредиент через Gemini
-            model = "gemini-2.5-flash" if is_premium_active(message.from_user.id) else "gemini-2.5-flash-lite"
-            gen_model = genai.GenerativeModel(model)
-
-            prompt = f"""
-            Ты — эксперт по питанию. Определи КБЖУ для продукта "{name}" в количестве {weight} г.
-            Ответ строго в JSON формате:
-            {{
-              "name": "название продукта",
-              "weight_g": {weight},
-              "cal": число,
-              "protein": число,
-              "fat": число,
-              "carbs": число
-            }}
-            """
-
-            response = await asyncio.to_thread(gen_model.generate_content, [prompt])
-
-            # ✅ Безопасно извлекаем результат из Gemini
-            if hasattr(response, "text") and response.text:
-                result = response.text.strip()
-            elif hasattr(response, "candidates"):
-                try:
-                    result = response.candidates[0].content.parts[0].text.strip()
-                except Exception:
-                    result = ""
-            else:
-                result = str(response).strip()
-
-            cleaned = result.replace("```json", "").replace("```", "").strip()
-            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            cleaned = match.group(0) if match else "{}"
-
-            try:
-                data = json.loads(cleaned)
-            except Exception:
-                data = {}
-
-            # Добавляем ингредиент в блюдо
-            new_item = {
-                "name": data.get("name", name),
-                "weight_g": weight,
-                "cal": data.get("cal", 0),
-                "protein": data.get("protein", 0),
-                "fat": data.get("fat", 0),
-                "carbs": data.get("carbs", 0)
-            }
-
-            wf["meal"]["items"].append(new_item)
-
-            # 🔄 Пересчёт общего КБЖУ
-            total = {"cal": 0, "protein": 0, "fat": 0, "carbs": 0}
-            for i in wf["meal"]["items"]:
-                total["cal"] += i.get("cal", 0)
-                total["protein"] += i.get("protein", 0)
-                total["fat"] += i.get("fat", 0)
-                total["carbs"] += i.get("carbs", 0)
-            wf["meal"]["total"] = {k: round(v, 2) for k, v in total.items()}
-
-            wf["stage"] = None
-
-            await message.answer(
-                f"✅ Ингредиент добавлен: *{new_item['name']}* ({weight} г)\n"
-                f"🔥 КБЖУ: {round(new_item['cal'])} ккал, "
-                f"Б: {round(new_item['protein'])} г, "
-                f"Ж: {round(new_item['fat'])} г, "
-                f"У: {round(new_item['carbs'])} г",
-                parse_mode="Markdown"
-            )
-            await show_updated_meal(message.from_user.id)
-
-        except Exception as e:
-            logging.error(f"Ошибка анализа нового ингредиента: {e}")
-            await message.answer("⚠️ Не удалось проанализировать ингредиент. Попробуй снова.")
-            wf["stage"] = None
-        return
-
-    # --- настройка целей питания (setup wizard) ---
-    if wf and wf.get("mode") == "setup":
-        lang = get_user_lang(message.from_user.id)
-        step = wf.get("step", 1)
-        user_input = message.text.strip()
-        data = wf.get("data", {})
-
-    try:
-        if step == 1:  # RMR — обязательное
-            if user_input.lower() == "calculate":
-                await message.answer("⚠️ Автоматический расчёт пока недоступен. Введите RMR вручную.")
-                return
-            rmr = float(user_input)
-            if rmr <= 0:
-                raise ValueError
-            data["rmr"] = rmr
-            wf["step"] = 2
-            await message.answer(LANG[lang]["setup_protein"], parse_mode="Markdown")
-
-        elif step == 2:  # Protein goal — опционально
-            if user_input.strip() == "":
-                data["protein_goal"] = None
-            else:
-                protein = int(user_input)
-                if protein <= 0:
-                    raise ValueError
-                data["protein_goal"] = protein
-            wf["step"] = 3
-            await message.answer(LANG[lang]["setup_carbs_min"], parse_mode="Markdown")
-
-        elif step == 3:  # Carbs min — опционально
-            if user_input.strip() == "":
-                data["carbs_min"] = None
-            else:
-                carbs_min = int(user_input)
-                if carbs_min < 0:
-                    raise ValueError
-                data["carbs_min"] = carbs_min
-            wf["step"] = 4
-            await message.answer(LANG[lang]["setup_carbs_max"], parse_mode="Markdown")
-
-        elif step == 4:  # Carbs max — опционально
-            if user_input.strip() == "":
-                data["carbs_max"] = None
-            else:
-                carbs_max = int(user_input)
-                if carbs_max < 0 or ("carbs_min" in data and data["carbs_min"] and carbs_max < data["carbs_min"]):
-                    await message.answer("⚠️ Максимум должен быть ≥ минимума.")
-                    return
-                data["carbs_max"] = carbs_max
-            wf["step"] = 5
-            await message.answer(LANG[lang]["setup_fat"], parse_mode="Markdown")
-
-        elif step == 5:  # Fat limit — опционально
-            if user_input.strip() == "":
-                data["fat_limit"] = None
-            else:
-                fat = int(user_input)
-                if fat < 0:
-                    raise ValueError
-                data["fat_limit"] = fat
-            wf["step"] = 6
-            await message.answer(LANG[lang]["setup_fibre"], parse_mode="Markdown")
-
-        elif step == 6:  # Fibre goal — опционально
-            if user_input.strip() == "":
-                data["fibre_goal"] = None
-            else:
-                fibre = int(user_input)
-                if fibre < 0:
-                    raise ValueError
-                data["fibre_goal"] = fibre
-
-            # Сохраняем ВСЁ в БД (None — если не задано)
-            update_fields = {
-                "rmr": data["rmr"],
-                "protein_goal": data.get("protein_goal"),
-                "carbs_min": data.get("carbs_min"),
-                "carbs_max": data.get("carbs_max"),
-                "fat_limit": data.get("fat_limit"),
-                "fibre_goal": data.get("fibre_goal")
-            }
-            update_user(message.from_user.id, **update_fields)
-
-            # Формируем сообщение о сохранении
-            report_lines = [f"🔥 RMR: {data['rmr']} ккал"]
-            if data.get("protein_goal"): report_lines.append(f"🍗 Белок: {data['protein_goal']} г")
-            if data.get("carbs_min") or data.get("carbs_max"):
-                carbs_range = f"{data.get('carbs_min', '–')}–{data.get('carbs_max', '–')}"
-                report_lines.append(f"🍞 Углеводы: {carbs_range} г")
-            if data.get("fat_limit"): report_lines.append(f"🥑 Жиры: до {data['fat_limit']} г")
-            if data.get("fibre_goal"): report_lines.append(f"🌾 Клетчатка: {data['fibre_goal']} г")
-
-            await message.answer(
-                "✅ *Настройки сохранены!*\n📊 Ваши цели:\n" + "\n".join(report_lines),
-                parse_mode="Markdown",
-                reply_markup=main_menu(lang)
-            )
-            dp.workflow_data.pop(user_key, None)
-
-        except (ValueError, TypeError):
-            await message.answer(LANG[lang]["setup_invalid_number"])
-        return
-
-    # Если идёт ручной ввод блюда
+    
+        # Если идёт ручной ввод блюда
     if wf and wf.get("mode") == "manual_input":
         dp.workflow_data[user_key]["mode"] = None
         user_text = message.text.strip()
@@ -1514,7 +1540,6 @@ async def handle_any_text(message: types.Message):
 
             builder = InlineKeyboardBuilder()
             builder.button(text="✏️ Изменить ингредиент", callback_data="edit_meal")
-            builder.button(text="➕ Добавить ингредиент", callback_data="add_ingredient")
             builder.button(text="✅ Добавить в статистику", callback_data="save_meal_to_stats")
             if not is_premium_active(message.from_user.id):
                 builder.button(text="💎 Получить Premium", callback_data="buy_premium")
@@ -1855,20 +1880,6 @@ async def show_updated_meal(user_id):
 # 💾 Сохранение обновлённого блюда в статистику
 # ======================================
 
-@dp.callback_query(F.data == "add_ingredient")
-async def add_ingredient(callback: types.CallbackQuery):
-    wf = dp.workflow_data.get(str(callback.from_user.id))
-    if not wf or "meal" not in wf:
-        await callback.message.answer("⚠️ Нет данных для добавления ингредиента. Сначала проанализируй фото или введи блюдо.")
-        await callback.answer()
-        return
-
-    wf["stage"] = "await_new_ingredient"
-    lang = get_user_lang(callback.from_user.id)
-    await callback.message.answer(LANG[lang]["enter_new_ingredient"])
-    await callback.answer()
-
-
 @dp.callback_query(F.data == "save_meal_to_stats")
 async def save_meal_to_stats(callback: types.CallbackQuery):
     """Добавление обновлённого блюда в статистику."""
@@ -1898,23 +1909,32 @@ async def save_meal_to_stats(callback: types.CallbackQuery):
 # 🕒 Автоматические отчёты для Premium
 # ======================================
 
-# async def send_summaries():
-#     """Автоотчёты для Premium-пользователей в 21:00."""
-#     while True:
-#         now = datetime.now()
-#         if now.hour == 21 and now.minute < 10:
-#             cursor.execute("SELECT user_id FROM users WHERE is_premium=1")
-#             for (uid,) in cursor.fetchall():
-#                 kcal, p, f, c = get_stats(uid)
-#                 if kcal > 0:
-#                     await bot.send_message(
-#                         uid,
-#                         f"📊 *Отчёт за сегодня:*\n"
-#                         f"Ккал: {round(kcal)}\n"
-#                         f"Б: {round(p)} г  Ж: {round(f)} г  У: {round(c)} г",
-#                         parse_mode="Markdown"
-#                     )
-#         await asyncio.sleep(600)
+async def send_summaries():
+    """Автоотчёты для Premium-пользователей в 21:00."""
+    while True:
+        now = datetime.now()
+        if now.hour == 21 and now.minute < 10:
+            cursor.execute("SELECT user_id FROM users WHERE is_premium=1")
+            for (uid,) in cursor.fetchall():
+                kcal, p, f, c = get_stats(uid)
+                if kcal > 0:
+                    await bot.send_message(
+                        uid,
+                        f"📊 *Отчёт за сегодня:*\n"
+                        f"Ккал: {round(kcal)}\n"
+                        f"Б: {round(p)} г  Ж: {round(f)} г  У: {round(c)} г",
+                        parse_mode="Markdown"
+                    )
+        await asyncio.sleep(600)
+
+
+@dp.message(F.text == "⬅️ Назад")
+async def go_back(message: types.Message):
+    # Очищаем workflow_data, чтобы не остались "висячие" состояния
+    user_key = str(message.from_user.id)
+    if user_key in dp.workflow_data:
+        del dp.workflow_data[user_key]
+    await message.answer("↩️ Возвращаюсь в главное меню", reply_markup=main_menu())
 
 # ======================================
 # ▶️ Запуск TasteBalance
@@ -1929,6 +1949,7 @@ async def main():
     except Exception as e:
         logging.exception("Failed to start stripe webserver: %s", e)
 
+    asyncio.create_task(send_summaries())
     logging.info("🚀 TasteBalance запущен и готов к приёму сообщений.")
     await dp.start_polling(bot)
 

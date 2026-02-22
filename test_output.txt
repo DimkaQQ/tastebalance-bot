@@ -1,0 +1,3 @@
+Testing aiogram imports...
+✓ Bot, Dispatcher, types imported successfully
+✗ Failed to import from aiogram.filters: cannot import name 'F' from 'aiogram.filters' (/Library/Frameworks/Python.framework/Versions/3.10/lib/python3.10/site-packages/aiogram/filters/__init__.py)
